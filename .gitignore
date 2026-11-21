@@ -2,3 +2,4 @@ sample/
 output.jsonl
 __pycache__/
 data/static.pickle
+data/map.pickle

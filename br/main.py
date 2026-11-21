@@ -15,6 +15,7 @@ import gzip
 import io
 import json
 import os
+import pickle
 import re
 import select as _select
 import sys
@@ -65,10 +66,24 @@ class _LazySets:
         return len(self.raw)
 
 
+MAP_PICKLE = os.path.join(HERE, "..", "data", "map.pickle")
+
+
+def load_map():
+    """The map as decoded at image build time (pickle), else from the gzip'd JSON."""
+    try:
+        if os.environ.get("BR_MAP") is None and os.path.getmtime(MAP_PICKLE) >= os.path.getmtime(MAP):
+            with open(MAP_PICKLE, "rb") as fh:
+                return pickle.load(fh)
+    except (OSError, pickle.PickleError, EOFError):
+        pass
+    with gzip.open(MAP, "rt") as fh:
+        return json.load(fh)
+
+
 class Maps:
     def __init__(self, tests):
-        with gzip.open(MAP, "rt") as fh:
-            m = json.load(fh)
+        m = load_map()
         self.rt_tests = tests  # runtime tests.json entries
         self.n = len(tests)
         id2num = {t["id"]: t["number"] for t in tests}
@@ -1329,6 +1344,7 @@ def spawn(job):
     pid = os.fork()
     if pid == 0:
         try:
+            os.setpgid(0, 0)
             os.close(r)
             devnull = os.open(os.devnull, os.O_WRONLY)
             os.dup2(devnull, 1)
@@ -1483,6 +1499,7 @@ def main():
             data = os.read(fd, 65536)
             if data:
                 j["buf"] += data
+                maybe_stop(j, pid, maps)
                 continue
             os.close(fd)
             _, _, ru = os.wait4(pid, 0)
@@ -1493,10 +1510,7 @@ def main():
         for fd, (pid, j) in list(active.items()):
             if now > j["deadline"]:
                 log(j["cid"], "child deadline hit")
-                try:
-                    os.kill(pid, 9)
-                except ProcessLookupError:
-                    pass
+                kill_group(pid)
                 os.waitpid(pid, 0)
                 os.close(fd)
                 del active[fd]
@@ -1518,6 +1532,47 @@ def main():
 
     ch = resource.getrusage(resource.RUSAGE_CHILDREN)
     log(f"total wall {time.time() - T0:.1f}s cpu parent {time.process_time():.1f}s children {ch.ru_utime + ch.ru_stime:.1f}s")
+
+
+STOP_CPU_FACTOR = float(os.environ.get("BR_STOP_CPU", "1.5"))   # grader cpu per recorded runner cpu
+STOP_P_PASS = float(os.environ.get("BR_STOP_P_PASS", "0.35"))   # chance a later candidate passes once one failed
+
+
+def kill_group(pid):
+    for f in (lambda: os.killpg(pid, 9), lambda: os.kill(pid, 9)):
+        try:
+            f()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+def maybe_stop(j, pid, maps):
+    """Once a candidate failed, the change is real and the rest likely fail too: stop running
+    them when that is cheaper than the expected over-selection of selecting them unrun."""
+    if j.get("stopped") or STOP_P_PASS >= 1:
+        return
+    done, fail = set(), set()
+    for line in j["buf"].decode(errors="replace").splitlines():
+        p = line.split()
+        if len(p) >= 2 and p[0].isdigit():
+            done.add(int(p[0]))
+            if p[1] == "F":
+                fail.add(int(p[0]))
+        elif p and p[0] == "I":
+            return  # import failure lines are handled by finish
+    if not fail:
+        return
+    rest = [x for x in j["run"] if x not in done]
+    if not rest:
+        return
+    cpu_rest = sum(maps.cpu.get(x, maps.seconds[x]) for x in rest) * STOP_CPU_FACTOR
+    sel = sorted(set(j["blind"]) | fail)
+    _, c0 = best_split(sel, maps.seconds)
+    _, c1 = best_split(sorted(set(sel) | set(rest)), maps.seconds)
+    if cpu_rest > STOP_P_PASS * (c1 - c0):
+        j["stopped"] = True
+        log(j["cid"], f"stop after a failure: {len(rest)} unrun candidates selected (cpu {cpu_rest:.2f} vs {c1 - c0:.2f} s)")
+        kill_group(pid)
 
 
 def finish(j, maps):
@@ -1551,12 +1606,16 @@ def finish(j, maps):
     j["fail"] = fail
     if os.environ.get("BR_DEBUG"):
         log(j["cid"], "results", j["buf"].decode(errors="replace").replace("\n", " | ")[:3000], "partial", sorted(j["partial"])[:20])
-    if not complete:
+    if not complete and not j.get("stopped"):
         log(j["cid"], "child did not complete;", len(set(j["run"]) - done), "tests unknown")
 
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--prepare"]:
         Source(ROOT).prepare(sys.argv[2])
+        with gzip.open(MAP, "rt") as fh:
+            m = json.load(fh)
+        with open(MAP_PICKLE, "wb") as fh:
+            pickle.dump(m, fh, protocol=pickle.HIGHEST_PROTOCOL)
     else:
         main()
