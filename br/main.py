@@ -125,6 +125,8 @@ class Maps:
         self.attrusers = m.get("attrusers", {})
         self.attr_global = set(m.get("attr_global", []))
         self.attr_import = m.get("attr_import", {})
+        self.import_dialects = m.get("import_dialects", {})
+        self.imp_users = m.get("imp_users", {})
         self.iso = {}
         for i, c in enumerate(m.get("iso") or []):
             n = self.idx2num[i]
@@ -990,21 +992,55 @@ class Planner:
                     self.full.add(t)
         return out
 
-    def import_parse_users(self, rel):
-        """Modules of the same dialect (file stem) that parse or tokenize SQL while they import,
-        e.g. templates in a class body: a dialect setting change can break that import."""
-        if not hasattr(self, "_parsing_mods"):
-            ie = self.m.import_exec
-            pm = set()
-            for f in ("sqlglot/tokenizer_core.py",):  # tokenizing SQL (the metaclasses also run parser.py/tokens.py code)
-                for si in ie["lines"].get(f, {}).values():
-                    pm.update(ie["mods"][i] for i in ie["sets"][si])
-            self._parsing_mods = pm
-        stem = rel.rsplit("/", 1)[-1]
+    def import_only_users(self, overrides):
+        """Tests in files that import a patched sqlglot module (or a module importing it) at
+        module level; they only notice the patch if that import fails."""
+        files = set()
+        pats = [f for f in overrides if f.startswith("sqlglot/") and f.endswith(".py")]
+        if not pats:
+            return set()
+        for f in self.s.rev_closure(pats):
+            if f.startswith("sqlglot/"):
+                mod = f[:-3].replace("/", ".").removesuffix(".__init__")
+                files |= set(self.m.imp_users.get(mod, ()))
         out = set()
-        for mod in sorted(self._parsing_mods):
-            if mod.rsplit("/", 1)[-1] == stem and mod.split("/")[1] in FAMILY_DIRS:
-                mu = self.module_users(mod)
+        for tf in files:
+            out |= self.m.by_file.get(tf, set())
+        return out
+
+    def check_modules(self, overrides):
+        """Modules to import to check that a patch does not break importing; None if too many."""
+        pats = [f for f in overrides if f.startswith("sqlglot/") and f.endswith(".py")]
+        for f, new in overrides.items():
+            if f in pats and new is None:
+                return None  # deleted module: importers fail
+        mods = {f[:-3].replace("/", ".").removesuffix(".__init__") for f in pats}
+        for f in self.s.rev_closure(pats):
+            if f.startswith("sqlglot/") and f.endswith(".py"):
+                mod = f[:-3].replace("/", ".").removesuffix(".__init__")
+                if mod in self.m.imp_users:
+                    mods.add(mod)
+        if len(mods) > 80:
+            return None
+        return sorted(mods)
+
+    def import_parse_users(self, rel):
+        """Users of modules that, while they import, instantiate dialect machinery defined in
+        rel (e.g. templates parsed in a class body): a setting change there can break or
+        change that import."""
+        mod = rel[:-3].replace("/", ".").removesuffix(".__init__")
+        out = set()
+        for m_, fams in sorted(self.m.import_dialects.items()):
+            if mod in fams:
+                if m_.split("/")[1] in ("dialects", "parsers", "generators", "tokenizers"):
+                    # values computed there live in class attributes, whose readers are recorded;
+                    # a failing import is caught by the import check
+                    pre = m_[:-3].replace("/", ".") + ":"
+                    for k, si in self.m.attrusers.items():
+                        if k.startswith(pre):
+                            out |= self.m.sets[si]
+                    continue
+                mu = self.module_users(m_)
                 if mu == ALL:
                     return ALL
                 out |= mu
@@ -1853,6 +1889,15 @@ def spawn(job):
             if job["purge"]:
                 for k in stale:
                     del sys.modules[k]
+            if job.get("check"):
+                # import check in its own process, so it does not change what tests see
+                cpid = os.fork()
+                if cpid == 0:
+                    try:
+                        runner.check_imports(ROOT, job["overrides"], job["redirects"], job["check"], w)
+                    finally:
+                        os._exit(0)
+                os.waitpid(cpid, 0)
             tests = sorted(((n, job["ids"][n]) for n in job["run"]), key=lambda x: x[1])
             # tests that time gc.collect/tracemalloc run on their own, before the heap fills up
             # (and without changing what the other tests see, e.g. which dialects are loaded)
@@ -1953,6 +1998,17 @@ def main():
                     cand = rest
         blind, run = choose(cand, maps, pcfg, min_run=GAMBLE_EVIDENCE if job["gamble"] else 0)
         job["partial"] = {n: pcfg[n] for n in run if n in pcfg}
+        rt_only = all(w.split(":", 2)[1].startswith(("rt", "lambda", "comment-only", "uncovered", "fixture", "other", "annotation"))
+                      for w in why if w.count(":") >= 1) if why and why != ["error"] else False
+        if cand != set(range(maps.n)) and not rt_only:
+            imp = planner.import_only_users(overrides) - set(cand)
+            if imp == ALL or imp:
+                mods = planner.check_modules(overrides)
+                if imp == ALL or mods is None:
+                    blind = list(blind) + sorted(set(range(maps.n)) - set(cand) if imp == ALL else imp)
+                else:
+                    job["imp_only"] = imp
+                    job["check"] = mods
         job.update(blind=set(blind), run=run, overrides=overrides, redirects=redirects, why=why, lazy=lazy)
         log(cid, f"cand={len(cand)} blind={len(blind)} run={len(run)}", ";".join(why)[:300])
 
@@ -1968,7 +2024,7 @@ def main():
     log(f"prepared in {time.process_time():.2f}s cpu")
     loaded = set(k for k in sys.modules if k.startswith("sqlglot") or k.startswith("tests"))
     ids = {t["number"]: t["id"] for t in tests}
-    queue = [j for j in jobs if j["run"]]
+    queue = [j for j in jobs if j["run"] or j.get("check")]
     # most expensive first so the tail is short
     queue.sort(key=lambda j: -sum(maps.cpu.get(x, 0.1) for x in j["run"]))
     active = {}
@@ -2016,6 +2072,11 @@ def main():
 
     for j in jobs:
         sel = set(j["blind"]) | j["fail"] | (set(j["run"]) - j["done"])
+        if j.get("imp_only"):
+            # test files that import a patched module at module level: only if it fails to import
+            if j.get("imp_bad") or not set(j.get("check", ())) <= j.get("imp_ok", set()):
+                sel |= j["imp_only"]
+                log(j["cid"], f"import check failed: {len(j['imp_only'])} importing tests selected")
         if j.get("gamble"):
             ran_ok = len(j["done"] - j["fail"])
             if j["fail"] or (set(j["run"]) - j["done"]) or ran_ok < GAMBLE_EVIDENCE:
@@ -2082,6 +2143,9 @@ def finish(j, maps):
             continue
         if p[0] == "D":
             complete = True
+        elif p[0] == "M":
+            if len(p) >= 3:
+                (j.setdefault("imp_ok", set()) if p[1] == "ok" else j.setdefault("imp_bad", set())).add(p[2])
         elif p[0] == "I":
             f = p[1]
             for x in j["run"]:

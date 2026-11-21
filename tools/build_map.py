@@ -78,6 +78,8 @@ def test_importers():
 IMPORTERS = test_importers()
 import_exec = {}   # (file, line) -> sqlglot modules whose import ran it
 attr_import = {}   # class attribute key -> sqlglot modules whose import read it
+imp_users = {}   # sqlglot module -> test files that import it at module level
+import_dialects = {}   # sqlglot module -> modules of dialect machinery instantiated while it imports
 
 
 def expand_mod(d):
@@ -95,6 +97,8 @@ def expand_mod(d):
             v = sub.pop(k)
             if not k.startswith("MOD:tests/"):
                 # import-time work of a sqlglot module
+                if key == "users":
+                    import_dialects.setdefault(k[4:], set()).update(x for x in v if x.startswith("sqlglot."))
                 if key == "attr_reads":
                     for a in v:
                         attr_import.setdefault(a, set()).add(k[4:])
@@ -103,6 +107,12 @@ def expand_mod(d):
                 continue
             for g in IMPORTERS.get(k[4:], {k[4:]}):
                 if not g.split("/")[-1].startswith("test_"):
+                    continue
+                if key == "users":
+                    # sqlglot modules a test module imports (or whose classes it instantiates)
+                    # at import: those test files only notice if that import fails
+                    for m_ in v:
+                        imp_users.setdefault(m_, set()).add(g)
                     continue
                 sub.setdefault("SETUP:" + g, []).extend(v)
     return d
@@ -249,6 +259,8 @@ for (f, l), v in import_exec.items():
 
 out = {
     "attr_import": {k: sorted(v) for k, v in attr_import.items()},
+    "import_dialects": {k: sorted(v) for k, v in import_dialects.items()},
+    "imp_users": {k: sorted(v) for k, v in imp_users.items()},
     "import_exec": {"mods": ie_mods, "sets": ie_sets, "lines": import_exec_out},
     "warm": {f: sorted(v) for f, v in warm.items()},
     "modusers": {m_: sid(v) for m_, v in modusers.items()},

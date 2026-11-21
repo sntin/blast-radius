@@ -350,12 +350,9 @@ def install_import_recorder():
 def pytest_sessionstart(session):
     import sqlglot
     instrument_expr_attrs()
-    for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
-        try:
-            importlib.import_module(m.name)
-        except Exception as e:
-            print("import fail", m.name, e, file=sys.stderr)
-    # record, per test, the modules of every Dialect/Tokenizer/Parser/Generator class instantiated
+    # record, per bucket, the modules of every Dialect/Tokenizer/Parser/Generator class
+    # instantiated (installed before the other modules import, so a module that parses SQL
+    # while it imports is seen too)
     from sqlglot.dialects.dialect import Dialect
     from sqlglot.tokens import Tokenizer
     from sqlglot.parser import Parser
@@ -375,6 +372,11 @@ def pytest_sessionstart(session):
 
     for b in (Dialect, Tokenizer, Parser, Generator):
         wrap(b)
+    for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+        try:
+            importlib.import_module(m.name)
+        except Exception as e:
+            print("import fail", m.name, e, file=sys.stderr)
     instrument_class_attrs()
     install_import_recorder()
     import tests.helpers as h

@@ -220,6 +220,23 @@ def _alarm(signum, frame):
     raise _Timeout()
 
 
+def check_imports(root, overrides, redirects, mods, out_fd):
+    """Import the given modules against the patched tree; report 'M ok|fail <module>'."""
+    sys.dont_write_bytecode = True
+    install_open_redirect(redirects)
+    sys.meta_path.insert(0, PatchedFinder(root, overrides))
+    signal.signal(signal.SIGPROF, _alarm)
+    for m in mods:
+        try:
+            signal.setitimer(signal.ITIMER_PROF, 20.0)
+            importlib.import_module(m)
+            signal.setitimer(signal.ITIMER_PROF, 0)
+            os.write(out_fd, f"M ok {m}\n".encode())
+        except BaseException:
+            signal.setitimer(signal.ITIMER_PROF, 0)
+            os.write(out_fd, f"M fail {m}\n".encode())
+
+
 def run(root, overrides, redirects, tests, out_fd, limits, lazy=(), partial=None):
     """tests: list of (num, 'tests/x.py::Class::method')."""
     sys.dont_write_bytecode = True
