@@ -104,6 +104,7 @@ class Maps:
         self.base_lines = {f: {int(k): v for k, v in d.items()} for f, d in m.get("base_lines", {}).items()}
         self.ent_lines = {f: {int(k): v for k, v in d.items()} for f, d in m.get("ent_lines", {}).items()}
         self.warm = {f: set(v) for f, v in m.get("warm", {}).items()}
+        self.import_exec = m.get("import_exec") or {"mods": [], "sets": [], "lines": {}}
         self.ent_sets = m.get("ent_sets", [])
         self.modusers = m.get("modusers", {})
         self.attrusers = m.get("attrusers", {})
@@ -569,11 +570,32 @@ def tokens_sig(src):
         return None
 
 
+def derived_names(tree, names):
+    """Module-level names computed (at import) from any of `names`, transitively."""
+    names = set(names)
+    out = set()
+    body = [st for st in tree.body if isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign))]
+    changed = True
+    while changed:
+        changed = False
+        for st in body:
+            loads = {t.id for t in ast.walk(st) if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Load)}
+            if not loads & (names | out):
+                continue
+            tgts = st.targets if isinstance(st, ast.Assign) else [st.target]
+            for t in (x for tg in tgts for x in ast.walk(tg)):
+                if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store) and t.id not in names | out:
+                    out.add(t.id)
+                    changed = True
+    return out
+
+
 class StmtIndex:
     """Innermost statement spans of a module."""
 
     def __init__(self, tree):
         self.spans = []
+        self.tree = tree
         if tree is None:
             return
         parents = {}
@@ -904,6 +926,26 @@ class Planner:
                     self.full.add(t)
         return out
 
+    def import_exec_users(self, rel, a, b):
+        """Tests that import a module whose import runs lines a..b of rel (a broken line there
+        breaks that import, e.g. at collection)."""
+        ie = self.m.import_exec
+        lines = ie["lines"].get(rel)
+        if not lines:
+            return set(), []
+        mods = set()
+        for x in range(a, b + 1):
+            k = lines.get(str(x))
+            if k is not None:
+                mods.update(ie["mods"][i] for i in ie["sets"][k])
+        out = set()
+        for mod in sorted(mods):
+            mu = self.module_users(mod)
+            if mu == ALL:
+                return ALL, sorted(mods)
+            out |= mu
+        return out, sorted(mods)
+
     def is_warm(self, rel, a, b):
         w = self.m.warm.get(rel)
         return bool(w) and any(x in w for x in range(a, b + 1))
@@ -926,6 +968,9 @@ class Planner:
                     mu = self.module_users(rel)
                     return (ALL if mu == ALL else mu | self.lines_tests(rel, a_, b_)), [f"warm:{a_}"]
                 rt = self.rt_tests(rel, a_, b_)
+                ie, iem = self.import_exec_users(rel, a_, b_)
+                if iem:
+                    return (ALL if ie == ALL else rt | ie), [f"lambda:{a_}", "import-exec:" + ",".join(iem)[:80]]
                 # the line holding the lambda body may also be counted as import (lambda creation)
                 return rt, [f"lambda:{a_}"] + ([] if rt else [f"uncovered:{a_}"])
             st = self.stmt_of(idx, node)
@@ -946,6 +991,12 @@ class Planner:
                 mu = self.module_users(rel)
                 return (ALL if mu == ALL else mu | self.lines_tests(rel, a_, b_)), [f"warm:{a_}"]
             rt = self.rt_tests(rel, a_, b_)
+            ie, iem = self.import_exec_users(rel, a_, b_)
+            if iem:
+                why.append("import-exec:" + ",".join(iem)[:80])
+                if ie == ALL:
+                    return ALL, why + [f"rt:{a_}-{b_}"]
+                rt = rt | ie
             if not rt:
                 why.append(f"uncovered:{a_}")
             return rt, why + [f"rt:{a_}-{b_}"]
@@ -981,6 +1032,8 @@ class Planner:
                 elif isinstance(t, (ast.Import, ast.ImportFrom)):
                     for al in t.names:
                         names.add((al.asname or al.name).split(".")[0])
+        if names and isinstance(idx.parents.get(st), ast.Module):
+            names |= derived_names(idx.tree, names)
         # enclosing classes (and their subclasses) stand in for generic attribute names
         classes = [c for c in idx.scope_chain(st) if isinstance(c, ast.ClassDef)]
         if isinstance(st, ast.ClassDef):
@@ -1173,7 +1226,8 @@ GAMBLE_P_FAIL = 0.3      # rough chance that a cheaper test fails, which then co
 GAMBLE_EVIDENCE = 5      # cheaper candidates that must run (and pass) to leave such a test out
 RUN_OVERHEAD = 0.12      # fork + import sqlglot in a child, seconds of CPU
 FILE_OVERHEAD = 0.03     # per test module imported
-CPU_SAFETY = 1.25
+CPU_SAFETY = float(os.environ.get("BR_CPU_SAFETY", "1.25"))
+RUN_P_FAIL = float(os.environ.get("BR_RUN_P_FAIL", "0"))  # chance a run candidate fails and is selected anyway
 
 
 def choose(cand, maps, partial_cfg=None, min_run=0, with_cost=False):
@@ -1211,6 +1265,9 @@ def choose(cand, maps, partial_cfg=None, min_run=0, with_cost=False):
             continue
         _, bc = best_split(blind, secs)
         rc = (RUN_OVERHEAD + fixed[k] + suffix[k]) if run else 0.0
+        if run and RUN_P_FAIL > 0:
+            _, ac = best_split(blind + run, secs)
+            rc += RUN_P_FAIL * (ac - bc)
         c = bc + rc
         if best is None or c < best[0] - 1e-9:
             best = (c, blind, run)
@@ -1282,9 +1339,23 @@ def spawn(job):
             if job["purge"]:
                 for k in stale:
                     del sys.modules[k]
-            # tests that time gc.collect/tracemalloc go first, before the heap fills up
-            tests = sorted(((n, job["ids"][n]) for n in job["run"]), key=lambda x: (x[1] not in GC_FIRST, x[1]))
+            tests = sorted(((n, job["ids"][n]) for n in job["run"]), key=lambda x: x[1])
+            # tests that time gc.collect/tracemalloc run on their own, before the heap fills up
+            # (and without changing what the other tests see, e.g. which dialects are loaded)
+            first = [t for t in tests if t[1] in GC_FIRST]
+            if first and len(first) < len(tests):
+                tests = [t for t in tests if t[1] not in GC_FIRST]
+                gpid = os.fork()
+                if gpid == 0:
+                    try:
+                        runner.run(ROOT, job["overrides"], job["redirects"], first, w, job["limits"], job["lazy"], job["partial"])
+                    finally:
+                        os._exit(0)
+                os.waitpid(gpid, 0)
             runner.run(ROOT, job["overrides"], job["redirects"], tests, w, job["limits"], job["lazy"], job["partial"])
+            if os.environ.get("BR_DEBUG"):
+                d = sys.modules.get("sqlglot.dialects")
+                os.write(w, f"X purge={job['purge']} dialects={getattr(d, 'DIALECTS', None)} file={getattr(d, '__file__', None)}\n".encode())
             os.write(w, b"D\n")
         except BaseException:
             pass
@@ -1478,6 +1549,8 @@ def finish(j, maps):
                     fail.add(x)
     j["done"] = done
     j["fail"] = fail
+    if os.environ.get("BR_DEBUG"):
+        log(j["cid"], "results", j["buf"].decode(errors="replace").replace("\n", " | ")[:3000], "partial", sorted(j["partial"])[:20])
     if not complete:
         log(j["cid"], "child did not complete;", len(set(j["run"]) - done), "tests unknown")
 

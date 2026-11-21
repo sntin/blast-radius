@@ -17,6 +17,7 @@ from collections import namedtuple
 import pytest
 
 mon = sys.monitoring
+DISABLE = mon.DISABLE
 TOOL = 3
 SRC = "/src/"
 cur = "IMPORT"
@@ -37,7 +38,10 @@ def _line(code, line):
         ok = code_ok[f] = f.startswith(SRC)
     if ok:
         hits[cur].add((f[len(SRC):], line))
-    return mon.DISABLE
+        if cur.startswith("MOD:sqlglot") and code.co_flags & 3 == 3:
+            # function code run while a sqlglot module is imported
+            hits.setdefault("FX:" + cur[4:], set()).add((f[len(SRC):], line))
+    return DISABLE
 
 
 _orig_open = builtins.open
@@ -151,9 +155,57 @@ def _subtest(self, *a, **k):
 
 unittest.TestCase.subTest = _subtest
 
+def _start(code, offset):
+    # a one-line lambda gets no LINE event for its only line: count its start instead
+    if code.co_name == "<lambda>":
+        _line(code, code.co_firstlineno)
+    return DISABLE
+
+
 mon.use_tool_id(TOOL, "brcov")
 mon.register_callback(TOOL, mon.events.LINE, _line)
-mon.set_events(TOOL, mon.events.LINE)
+mon.register_callback(TOOL, mon.events.PY_START, _start)
+mon.set_events(TOOL, mon.events.LINE | mon.events.PY_START)
+
+
+class _ModLoader:
+    """Runs a test module's top-level code in its own MOD:<file> bucket."""
+
+    def __init__(self, inner, rel):
+        self.inner = inner
+        self.rel = rel
+
+    def create_module(self, spec):
+        return self.inner.create_module(spec)
+
+    def exec_module(self, module):
+        prev = cur
+        setcur("MOD:" + self.rel)
+        try:
+            return self.inner.exec_module(module)
+        finally:
+            setcur(prev)
+
+    def __getattr__(self, k):
+        return getattr(self.inner, k)
+
+
+class _ModFinder:
+    def find_spec(self, name, path=None, target=None):
+        if not (name == "tests" or name.startswith(("tests.", "sqlglot"))):
+            return None
+        for f in sys.meta_path:
+            if f is self or not hasattr(f, "find_spec"):
+                continue
+            spec = f.find_spec(name, path, target)
+            if spec is not None:
+                if spec.origin and spec.origin.startswith(SRC) and spec.loader is not None:
+                    spec.loader = _ModLoader(spec.loader, spec.origin[len(SRC):])
+                return spec
+        return None
+
+
+sys.meta_path.insert(0, _ModFinder())
 
 
 attr_reads = {}   # bucket -> set of "module:qualname.attr"
@@ -205,6 +257,47 @@ def instrument_class_attrs():
     print("instrumented", n, "class attributes", file=sys.stderr)
 
 
+def install_import_recorder():
+    """Record, per bucket, the sqlglot modules that test code imports (all are preloaded, so
+    such an import is otherwise invisible; in CI it may be the first import)."""
+    import types
+    orig_import = builtins.__import__
+    orig_import_module = importlib.import_module
+
+    def note(mods):
+        if cur == "IMPORT":
+            return
+        users.setdefault(test_id or cur, set()).update(mods)
+
+    def _imp(name, globals=None, locals=None, fromlist=(), level=0):
+        m = orig_import(name, globals, locals, fromlist, level)
+        try:
+            if level == 0 and name.startswith("sqlglot") and globals and str(globals.get("__name__", "")).startswith("tests"):
+                mods = {name}
+                for it in fromlist or ():
+                    v = getattr(m, it, None)
+                    if isinstance(v, types.ModuleType):
+                        mods.add(v.__name__)
+                    elif isinstance(v, type) and str(v.__module__).startswith("sqlglot"):
+                        mods.add(v.__module__)
+                note(mods)
+        except Exception:
+            pass
+        return m
+
+    def _imod(name, package=None):
+        m = orig_import_module(name, package)
+        try:
+            if name.startswith("sqlglot") and str(sys._getframe(1).f_globals.get("__name__", "")).startswith("tests"):
+                note({m.__name__})
+        except Exception:
+            pass
+        return m
+
+    builtins.__import__ = _imp
+    importlib.import_module = _imod
+
+
 def pytest_sessionstart(session):
     import sqlglot
     for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
@@ -233,6 +326,7 @@ def pytest_sessionstart(session):
     for b in (Dialect, Tokenizer, Parser, Generator):
         wrap(b)
     instrument_class_attrs()
+    install_import_recorder()
     import tests.helpers as h
     orig_pairs = h.load_sql_fixture_pairs
 

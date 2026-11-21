@@ -20,8 +20,91 @@ setup = {}      # (file, line) -> set(test file)
 imp = set()
 fopen = {}      # path -> set(test idx)
 fopen_setup = {}
+SRCROOT = sys.argv[4] if len(sys.argv) > 4 else "/tmp/claude-0/work/sqlglot"
+
+
+def test_importers():
+    """test module file -> test files whose (static, transitive) imports include it."""
+    import ast, os
+    files = sorted(glob.glob(f"{SRCROOT}/tests/**/*.py", recursive=True))
+    rel = [f[len(SRCROOT) + 1:] for f in files]
+    bymod = {r[:-3].replace("/", "."): r for r in rel}
+    for r in rel:
+        if r.endswith("/__init__.py"):
+            bymod[r[: -len("/__init__.py")].replace("/", ".")] = r
+    deps = {}
+    for f, r in zip(files, rel):
+        pkg = r[:-3].replace("/", ".").rsplit(".", 1)[0]
+        out = set()
+        try:
+            tree = ast.parse(open(f).read())
+        except SyntaxError:
+            continue
+        for n in ast.walk(tree):
+            mods = []
+            if isinstance(n, ast.Import):
+                mods = [a.name for a in n.names]
+            elif isinstance(n, ast.ImportFrom):
+                base = n.module or ""
+                if n.level:
+                    parts = pkg.split(".")
+                    parts = parts[: len(parts) - (n.level - 1)]
+                    base = ".".join(parts + ([n.module] if n.module else []))
+                mods = [base] + [f"{base}.{a.name}" for a in n.names]
+            for m in mods:
+                while m:
+                    if m in bymod:
+                        out.add(bymod[m])
+                    m = m.rpartition(".")[0]
+        parts = r.split("/")[:-1]
+        for i in range(1, len(parts) + 1):
+            init = "/".join(parts[:i]) + "/__init__.py"
+            if init in rel and init != r:
+                out.add(init)
+        deps[r] = out
+    imp = {}
+    for r in rel:
+        seen, stack = {r}, [r]
+        while stack:
+            for d in deps.get(stack.pop(), ()):
+                if d not in seen:
+                    seen.add(d)
+                    stack.append(d)
+        for d in seen:
+            imp.setdefault(d, set()).add(r)
+    return imp
+
+
+IMPORTERS = test_importers()
+import_exec = {}   # (file, line) -> sqlglot modules whose import ran it
+
+
+def expand_mod(d):
+    """MOD:<test module> buckets (module-level code of a test module, run once per process by
+    whichever test file imported it first) count for every test file that imports it."""
+    for k in [k for k in d.get("hits", {}) if k.startswith("FX:")]:
+        # function code run while sqlglot module <k> is imported
+        for a, b in d["hits"].pop(k):
+            import_exec.setdefault((a, b), set()).add(k[3:])
+    for key in ("hits", "users", "attr_reads", "opens"):
+        sub = d.get(key)
+        if not sub:
+            continue
+        for k in [k for k in sub if k.startswith("MOD:")]:
+            v = sub.pop(k)
+            if not k.startswith("MOD:tests/"):
+                # import-time work of a sqlglot module
+                sub.setdefault("IMPORT", []).extend(v)
+                continue
+            for g in IMPORTERS.get(k[4:], {k[4:]}):
+                if not g.split("/")[-1].startswith("test_"):
+                    continue
+                sub.setdefault("SETUP:" + g, []).extend(v)
+    return d
+
+
 for f in sorted(glob.glob(f"{outdir}/cov-*.json")):
-    d = json.load(open(f))
+    d = expand_mod(json.load(open(f)))
     for k, v in d["hits"].items():
         if k in num:
             for a, b in v:
@@ -148,7 +231,19 @@ for wf in glob.glob(f"{outdir}/warm-*.json"):
             if (a, b) not in imp and a.startswith("sqlglot/"):
                 warm.setdefault(a, set()).add(b)
 
+ie_mods = sorted({m_ for v in import_exec.values() for m_ in v})
+ie_idx = {m_: i for i, m_ in enumerate(ie_mods)}
+ie_sets, ie_sid = [], {}
+import_exec_out = {}
+for (f, l), v in import_exec.items():
+    key = tuple(sorted(ie_idx[m_] for m_ in v))
+    if key not in ie_sid:
+        ie_sid[key] = len(ie_sets)
+        ie_sets.append(list(key))
+    import_exec_out.setdefault(f, {})[str(l)] = ie_sid[key]
+
 out = {
+    "import_exec": {"mods": ie_mods, "sets": ie_sets, "lines": import_exec_out},
     "warm": {f: sorted(v) for f, v in warm.items()},
     "modusers": {m_: sid(v) for m_, v in modusers.items()},
     "attrusers": {k_: sid(v) for k_, v in attrusers.items()},
