@@ -106,6 +106,8 @@ class Maps:
         self.warm = {f: set(v) for f, v in m.get("warm", {}).items()}
         self.ent_sets = m.get("ent_sets", [])
         self.modusers = m.get("modusers", {})
+        self.attrusers = m.get("attrusers", {})
+        self.attr_global = set(m.get("attr_global", []))
         self.iso = {}
         for i, c in enumerate(m.get("iso") or []):
             n = self.idx2num[i]
@@ -197,6 +199,7 @@ class Source:
             self._core = d["core"]
             self.hier = d["hier"]
             self.spans = d["spans"]
+            self._import_names = d.get("import_names")
 
     def span_of(self, f, line):
         """Innermost statement (start, end) holding line of original file f."""
@@ -209,6 +212,54 @@ class Source:
                     best[x] = (a, b)
             sp = self.spans[f] = best
         return sp.get(line)
+
+    @property
+    def import_names(self):
+        """Names read while modules/classes are being built: class bodies, module bodies,
+        metaclass methods and __init_subclass__ hooks (Load context, attributes, string keys)."""
+        if getattr(self, "_import_names", None) is None:
+            out = set()
+
+            def grab(node):
+                for t in ast.walk(node):
+                    if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Load):
+                        out.add(t.id)
+                    elif isinstance(t, ast.Attribute) and isinstance(t.ctx, ast.Load):
+                        out.add(t.attr)
+                    elif isinstance(t, ast.Constant) and isinstance(t.value, str) and t.value.isidentifier():
+                        out.add(t.value)
+
+            def visit(body, in_meta=False):
+                for st in body:
+                    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if in_meta or st.name == "__init_subclass__":
+                            grab(st)
+                        else:
+                            for d in st.decorator_list + st.args.defaults + st.args.kw_defaults:
+                                if d is not None:
+                                    grab(d)
+                    elif isinstance(st, ast.ClassDef):
+                        meta = any(isinstance(b, ast.Name) and b.id == "type" for b in st.bases)
+                        for b in st.bases + st.decorator_list + [k.value for k in st.keywords]:
+                            grab(b)
+                        visit(st.body, meta)
+                    else:
+                        # executed at import; for assignments only the value side is a read
+                        if isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                            if st.value is not None:
+                                grab(st.value)
+                            if isinstance(st, ast.AugAssign):
+                                grab(st.target)
+                        else:
+                            grab(st)
+
+            for f in self.pyfiles:
+                if f.startswith("sqlglot/"):
+                    tree = self.tree(f)
+                    if tree is not None:
+                        visit(tree.body)
+            self._import_names = out
+        return self._import_names
 
     def prepare(self, dest):
         import pickle
@@ -230,7 +281,8 @@ class Source:
         for f in self.pyfiles:
             self.span_of(f, 0)
         with open(dest, "wb") as fh:
-            pickle.dump({"fwd": fwd, "rev": rev, "core": self.core, "hier": hier, "spans": self.spans}, fh, protocol=4)
+            pickle.dump({"fwd": fwd, "rev": rev, "core": self.core, "hier": hier, "spans": self.spans,
+                         "import_names": self.import_names}, fh, protocol=4)
 
     def read(self, rel):
         if rel not in self.text:
@@ -940,6 +992,24 @@ class Planner:
             # by code that names the attribute on the class directly. Generic readers of a common
             # attribute name only see this value through an instance, which module users cover.
             why.append("dialect-attr")
+            mod = rel[:-3].replace("/", ".")
+            qual = ".".join(c.name for c in reversed(classes))
+            keys = [f"{mod}:{qual}.{nm}" for nm in names]
+            if names and all(k in self.m.attrusers and k not in self.m.attr_global for k in keys) and not (
+                names & self.s.import_names
+            ):
+                # every reader of this attribute was seen at run time: those tests, plus code of the class
+                out = set()
+                for k in keys:
+                    out |= self.m.sets[self.m.attrusers[k]]
+                for c in classes:
+                    out |= self.lines_tests(rel, c.lineno, c.end_lineno) if c is classes[0] else set()
+                for nm in names:
+                    if not self.too_common(nm):
+                        nu = self.name_users([nm])
+                        if nu != ALL and len(nu) <= 150:
+                            out |= nu
+                return out, why + ["attr-readers"]
             for c in classes:
                 extra |= self.lines_tests(rel, c.lineno, c.end_lineno)
             for nm in names:

@@ -156,6 +156,55 @@ mon.register_callback(TOOL, mon.events.LINE, _line)
 mon.set_events(TOOL, mon.events.LINE)
 
 
+attr_reads = {}   # bucket -> set of "module:qualname.attr"
+FAMILY = ("sqlglot.dialects.", "sqlglot.parsers.", "sqlglot.generators.", "sqlglot.tokenizers.", "sqlglot.typing.")
+
+
+class _Rec:
+    """Stands in for a plain class attribute and records who reads it."""
+    __slots__ = ("value", "key")
+
+    def __init__(self, value, key):
+        self.value = value
+        self.key = key
+
+    def __get__(self, obj, owner=None):
+        attr_reads.setdefault(test_id or cur, set()).add(self.key)
+        return self.value
+
+
+def instrument_class_attrs():
+    """Wrap data attributes of classes defined in dialect-family modules (after import, so
+    class creation already consumed them)."""
+    import types, enum
+    n = 0
+    for name, mod in list(sys.modules.items()):
+        if not name.startswith(FAMILY) or mod is None:
+            continue
+        stack = [v for v in vars(mod).values() if isinstance(v, type) and v.__module__ == name]
+        seen = set()
+        while stack:
+            cls = stack.pop()
+            if id(cls) in seen:
+                continue
+            seen.add(id(cls))
+            for k, v in list(cls.__dict__.items()):
+                if isinstance(v, type):
+                    if v.__module__ == name:
+                        stack.append(v)
+                    continue
+                if k.startswith("__") or callable(v) or isinstance(v, (staticmethod, classmethod, property, types.MemberDescriptorType, types.GetSetDescriptorType)):
+                    continue
+                if isinstance(v, enum.Enum) and False:
+                    continue
+                try:
+                    setattr(cls, k, _Rec(v, f"{name}:{cls.__qualname__}.{k}"))
+                    n += 1
+                except (TypeError, AttributeError):
+                    pass
+    print("instrumented", n, "class attributes", file=sys.stderr)
+
+
 def pytest_sessionstart(session):
     import sqlglot
     for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
@@ -183,6 +232,7 @@ def pytest_sessionstart(session):
 
     for b in (Dialect, Tokenizer, Parser, Generator):
         wrap(b)
+    instrument_class_attrs()
     import tests.helpers as h
     orig_pairs = h.load_sql_fixture_pairs
 
@@ -245,6 +295,7 @@ def pytest_sessionfinish(session):
     wid = os.environ.get("PYTEST_XDIST_WORKER", "main")
     out = {"hits": {k: sorted(v) for k, v in hits.items()},
            "opens": {k: sorted(v) for k, v in opens.items()},
-           "jobs": fixture_pos, "yields": yields, "users": {k: sorted(v) for k, v in users.items()}}
+           "jobs": fixture_pos, "yields": yields, "users": {k: sorted(v) for k, v in users.items()},
+           "attr_reads": {k: sorted(v) for k, v in attr_reads.items()}}
     with _orig_open(f"/out/cov-{wid}.json", "w") as f:
         json.dump(out, f)

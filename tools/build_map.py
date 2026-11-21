@@ -13,7 +13,9 @@ base = {}       # (file, line) -> set(test idx)   (test body outside pooled jobs
 ent = {}        # (file, line) -> {test idx: set(job k)}
 jobs = {}       # test idx -> list of (fixture, pos) or None per job
 yields = {}
-modusers = {}   # sqlglot module -> tests that instantiated a class defined there (via MRO)
+modusers = {}
+attrusers = {}  # "module:Class.attr" -> tests that read that class attribute at run time
+attr_global = set()   # sqlglot module -> tests that instantiated a class defined there (via MRO)
 setup = {}      # (file, line) -> set(test file)
 imp = set()
 fopen = {}      # path -> set(test idx)
@@ -46,6 +48,20 @@ for f in sorted(glob.glob(f"{outdir}/cov-*.json")):
             for mod in v:
                 if mod.startswith("sqlglot"):
                     modusers.setdefault(mod, set()).update(tgt)
+    for k, v in d.get("attr_reads", {}).items():
+        tgt = None
+        if k in num:
+            tgt = {num[k]}
+        elif k.startswith("E:"):
+            tid = k[2:].rsplit("#", 1)[0]
+            tgt = {num[tid]} if tid in num else None
+        elif k.startswith("SETUP:"):
+            tgt = {num[x] for x in num if x.startswith(k[6:] + "::")}
+        else:
+            attr_global.update(v)
+        if tgt:
+            for key in v:
+                attrusers.setdefault(key, set()).update(tgt)
     for k, v in d.get("jobs", {}).items():
         if k in num:
             jobs[num[k]] = v
@@ -135,6 +151,8 @@ for wf in glob.glob(f"{outdir}/warm-*.json"):
 out = {
     "warm": {f: sorted(v) for f, v in warm.items()},
     "modusers": {m_: sid(v) for m_, v in modusers.items()},
+    "attrusers": {k_: sid(v) for k_, v in attrusers.items()},
+    "attr_global": sorted(attr_global),
     "ids": ids,
     "seconds": [t["seconds"] for t in tests],
     "cpu": cpu,
