@@ -209,6 +209,8 @@ sys.meta_path.insert(0, _ModFinder())
 
 
 attr_reads = {}   # bucket -> set of "module:qualname.attr"
+dial_sites = {}   # dialect-machinery module -> "file:line" of import-time statements instantiating it
+attr_sites = {}   # expression attr key -> "file:line" of import-time statements reading it
 FAMILY = ("sqlglot.dialects.", "sqlglot.parsers.", "sqlglot.generators.", "sqlglot.tokenizers.", "sqlglot.typing.")
 
 
@@ -242,6 +244,15 @@ class _ORec:
         if k is None:
             k = self.cache[owner] = f"sqlglot.expressions:{owner.__qualname__}.{self.attr}"
         attr_reads.setdefault(test_id or cur, set()).add(k)
+        if not test_id and cur.startswith("MOD:sqlglot"):
+            # import-time read: note the module-level / class-body statement doing it
+            f = sys._getframe(1)
+            while f is not None:
+                c = f.f_code
+                if c.co_flags & 3 != 3 and c.co_filename.startswith(SRC):
+                    attr_sites.setdefault(k, set()).add(f"{c.co_filename[len(SRC):]}:{f.f_lineno}")
+                    break
+                f = f.f_back
         return self.value
 
 
@@ -366,6 +377,18 @@ def pytest_sessionstart(session):
             ms = users.setdefault(key, set())
             for c in type(self).__mro__:
                 ms.add(c.__module__)
+            if not test_id and cur.startswith("MOD:sqlglot"):
+                # instantiated while a module imports: note the statement doing it
+                f = sys._getframe(1)
+                while f is not None:
+                    c = f.f_code
+                    if c.co_flags & 3 != 3 and c.co_filename.startswith(SRC):
+                        site = f"{c.co_filename[len(SRC):]}:{f.f_lineno}"
+                        for m_ in {c_.__module__ for c_ in type(self).__mro__}:
+                            if m_.startswith("sqlglot"):
+                                dial_sites.setdefault(m_, set()).add(site)
+                        break
+                    f = f.f_back
             return orig_init(self, *a, **k)
 
         base.__init__ = __init__
@@ -442,6 +465,8 @@ def pytest_sessionfinish(session):
     out = {"hits": {k: sorted(v) for k, v in hits.items()},
            "opens": {k: sorted(v) for k, v in opens.items()},
            "jobs": fixture_pos, "yields": yields, "users": {k: sorted(v) for k, v in users.items()},
-           "attr_reads": {k: sorted(v) for k, v in attr_reads.items()}}
+           "attr_reads": {k: sorted(v) for k, v in attr_reads.items()},
+           "attr_sites": {k: sorted(v) for k, v in attr_sites.items()},
+           "dial_sites": {k: sorted(v) for k, v in dial_sites.items()}}
     with _orig_open(f"/out/cov-{wid}.json", "w") as f:
         json.dump(out, f)

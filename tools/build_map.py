@@ -78,6 +78,8 @@ def test_importers():
 IMPORTERS = test_importers()
 import_exec = {}   # (file, line) -> sqlglot modules whose import ran it
 attr_import = {}   # class attribute key -> sqlglot modules whose import read it
+dial_sites = {}    # dialect-machinery module -> "file:line" of import-time statements instantiating it
+attr_sites = {}    # expression attribute key -> "file:line" of import-time statements reading it
 imp_users = {}   # sqlglot module -> test files that import it at module level
 import_dialects = {}   # sqlglot module -> modules of dialect machinery instantiated while it imports
 
@@ -120,6 +122,10 @@ def expand_mod(d):
 
 for f in sorted(glob.glob(f"{outdir}/cov-*.json")):
     d = expand_mod(json.load(open(f)))
+    for k_, v_ in d.get("attr_sites", {}).items():
+        attr_sites.setdefault(k_, set()).update(v_)
+    for k_, v_ in d.get("dial_sites", {}).items():
+        dial_sites.setdefault(k_, set()).update(v_)
     for k, v in d["hits"].items():
         if k in num:
             for a, b in v:
@@ -259,6 +265,8 @@ for (f, l), v in import_exec.items():
 
 out = {
     "attr_import": {k: sorted(v) for k, v in attr_import.items()},
+    "attr_sites": {k: sorted(v) for k, v in attr_sites.items()},
+    "dial_sites": {k: sorted(v) for k, v in dial_sites.items()},
     "import_dialects": {k: sorted(v) for k, v in import_dialects.items()},
     "imp_users": {k: sorted(v) for k, v in imp_users.items()},
     "import_exec": {"mods": ie_mods, "sets": ie_sets, "lines": import_exec_out},

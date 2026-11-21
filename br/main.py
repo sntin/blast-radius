@@ -125,6 +125,8 @@ class Maps:
         self.attrusers = m.get("attrusers", {})
         self.attr_global = set(m.get("attr_global", []))
         self.attr_import = m.get("attr_import", {})
+        self.attr_sites = m.get("attr_sites", {})
+        self.dial_sites = m.get("dial_sites", {})
         self.import_dialects = m.get("import_dialects", {})
         self.imp_users = m.get("imp_users", {})
         self.iso = {}
@@ -208,6 +210,7 @@ class Source:
         self._core = None
         self.hier = None
         self.spans = {}
+        self.entry_refs = {}
         st = os.path.join(os.path.dirname(MAP), "static.pickle")
         if os.path.exists(st) and os.environ.get("BR_NO_STATIC") != "1":
             import pickle
@@ -218,6 +221,7 @@ class Source:
             self._core = d["core"]
             self.hier = d["hier"]
             self.spans = d["spans"]
+            self.entry_refs = d.get("entry_refs", {})
             self._import_names = d.get("import_names")
             self._import_sites = d.get("import_sites")
             self._classfile = d.get("classfile")
@@ -226,13 +230,51 @@ class Source:
         """Innermost statement (start, end) holding line of original file f."""
         sp = self.spans.get(f)
         if sp is None:
-            idx = StmtIndex(self.tree(f))
+            tree = self.tree(f)
+            idx = StmtIndex(tree)
+            spans = [(a, b) for a, b, n in idx.spans]
+            # entries of a dict built at import (e.g. {exp.X: {...}, ...} tables): each entry on
+            # its own, so a name in one entry does not stand for the whole table
+            # an entry whose value names a function of this file (`exp.X: _x_sql`) also
+            # stands for that function's code
+            funcs = {}
+            for st in getattr(tree, "body", []):
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    funcs[st.name] = (st.lineno, st.end_lineno)
+            refs = self.entry_refs.setdefault(f, {})
+            stack = [(st, None) for st in getattr(tree, "body", [])]
+            while stack:
+                st, cls = stack.pop()
+                if isinstance(st, ast.ClassDef):
+                    stack.extend((x, st) for x in st.body)
+                elif isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, ast.Dict):
+                    own = dict(funcs)
+                    if cls is not None:
+                        for x in cls.body:
+                            if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                own[x.name] = (x.lineno, x.end_lineno)
+                    for k, v in zip(st.value.keys, st.value.values):
+                        a, b = (k.lineno if k is not None else v.lineno), v.end_lineno
+                        spans.append((a, b))
+                        r = [own[x.id] for x in ast.walk(v) if isinstance(x, ast.Name) and x.id in own]
+                        r += [own[x.attr] for x in ast.walk(v) if isinstance(x, ast.Attribute) and x.attr in own
+                              and isinstance(x.value, ast.Name) and x.value.id in ("self", "cls")]
+                        if r:
+                            refs[(a, b)] = r
             best = {}
-            for a, b, n in sorted(idx.spans, key=lambda x: -(x[1] - x[0])):
+            for a, b in sorted(spans, key=lambda x: -(x[1] - x[0])):
                 for x in range(a, b + 1):
                     best[x] = (a, b)
             sp = self.spans[f] = best
         return sp.get(line)
+
+    def span_ranges(self, f, line):
+        """Line ranges that stand for `line` of f: its statement (or dict entry), plus the
+        functions that entry names."""
+        sp = self.span_of(f, line)
+        if sp is None:
+            return [(line, line)]
+        return [sp] + self.entry_refs.get(f, {}).get(sp, [])
 
     @property
     def import_names(self):
@@ -333,7 +375,7 @@ class Source:
         for f in self.pyfiles:
             self.span_of(f, 0)
         with open(dest, "wb") as fh:
-            pickle.dump({"fwd": fwd, "rev": rev, "core": self.core, "hier": hier, "spans": self.spans,
+            pickle.dump({"fwd": fwd, "rev": rev, "core": self.core, "hier": hier, "spans": self.spans, "entry_refs": self.entry_refs,
                          "import_names": self.import_names, "import_sites": self.import_sites,
                          "classfile": self.classfile}, fh, protocol=4)
 
@@ -857,10 +899,9 @@ class Planner:
                 return ALL
             hits = self.s.name_lines(nm) + self.s.name_lines(nm.lower() + "_sql")
             for f, l in hits:
-                sp = self.s.span_of(f, l)
-                rng = range(sp[0], sp[1] + 1) if sp else [l]
-                for L in rng:
-                    out |= self.m.tests_at(f, L)
+                for a_, b_ in self.s.span_ranges(f, l):
+                    for L in range(a_, b_ + 1):
+                        out |= self.m.tests_at(f, L)
         return out
 
     def name_users(self, names):
@@ -872,10 +913,9 @@ class Planner:
             if len(hits) > 400:
                 return ALL
             for f, l in hits:
-                sp = self.s.span_of(f, l)
-                rng = range(sp[0], sp[1] + 1) if sp else [l]
-                for L in rng:
-                    out |= self.m.tests_at(f, L)
+                for a_, b_ in self.s.span_ranges(f, l):
+                    for L in range(a_, b_ + 1):
+                        out |= self.m.tests_at(f, L)
         return out
 
     def plan_py(self, rel, old, new, changed, inserted):
@@ -1032,6 +1072,12 @@ class Planner:
         out = set()
         for m_, fams in sorted(self.m.import_dialects.items()):
             if mod in fams:
+                sites = [x for x in self.m.dial_sites.get(mod, ()) if x.rpartition(":")[0] == m_]
+                su = self.sites_users(sites, m_)
+                if su is not None:
+                    # only what the instantiating statements built can differ
+                    out |= su
+                    continue
                 if m_.split("/")[1] in ("dialects", "parsers", "generators", "tokenizers"):
                     # values computed there live in class attributes, whose readers are recorded;
                     # a failing import is caught by the import check
@@ -1363,6 +1409,10 @@ class Planner:
                 out |= self.m.sets[self.m.attrusers[k]]
             for mod in self.m.attr_import.get(k, ()):
                 # read while that module imports (e.g. a template parsed in a class body)
+                su = self.attr_site_users(k, mod)
+                if su is not None:
+                    out |= su
+                    continue
                 mu = self.module_users(mod)
                 if mu == ALL:
                     return ALL
@@ -1412,6 +1462,81 @@ class Planner:
                 if nu == ALL:
                     return ALL
                 out |= nu
+        return out
+
+    def attr_site_users(self, key, mod):
+        """Tests that see what the import of `mod` built from expression attribute `key`: the
+        recorded statements reading it are class-body or module-level assignments, so their
+        results are followed to the readers of those class attributes / names. A failing import
+        is caught by the import check (users of `mod` are selected then). None if not understood."""
+        sites = [x for x in self.m.attr_sites.get(key, ()) if x.rpartition(":")[0] == mod]
+        return self.sites_users(sites, mod)
+
+    def sites_users(self, sites, mod):
+        if not sites or mod.split("/")[1] not in FAMILY_DIRS:
+            return None
+        out = set()
+        for site in sites:
+            f, _, l = site.rpartition(":")
+            tree = self.s.tree(f)
+            if tree is None:
+                return None
+            idx = self._stmt_index(f, tree)
+            found = idx.find(int(l))
+            if found is None:
+                return None
+            st = found[2]
+            # the outermost statement at that level (a multi-line assignment)
+            chain = idx.scope_chain(st)
+            if any(not isinstance(x, ast.ClassDef) for x in chain):
+                return None
+            while idx.parents.get(st) is not None and not isinstance(idx.parents.get(st), (ast.ClassDef, ast.Module)):
+                st = idx.parents[st]
+            if not isinstance(st, (ast.Assign, ast.AnnAssign)):
+                return None
+            tg = set()
+            for t in (st.targets if isinstance(st, ast.Assign) else [st.target]):
+                if not isinstance(t, ast.Name):
+                    return None
+                tg.add(t.id)
+            if chain:
+                # (no recorded key: no test read that attribute)
+                for kk in self.owner_keys(chain, tg):
+                    out |= self.m.sets[self.m.attrusers[kk]]
+            else:
+                tg |= derived_names(tree, tg)
+                nu = self.name_users(tg)
+                if nu == ALL:
+                    return None
+                out |= nu
+                # class attributes aliasing those names at import (`X = _X` in a class body)
+                for name in tg:
+                    for f2, l2 in self.s.name_lines(name):
+                        t2 = self.s.tree(f2)
+                        if t2 is None:
+                            return None
+                        i2 = self._stmt_index(f2, t2)
+                        fd = i2.find(l2)
+                        if fd is None:
+                            continue
+                        c2 = i2.scope_chain(fd[2])
+                        if not c2 or not all(isinstance(x, ast.ClassDef) for x in c2):
+                            continue
+                        s2 = fd[2]
+                        while i2.parents.get(s2) is not None and not isinstance(i2.parents.get(s2), ast.ClassDef):
+                            s2 = i2.parents[s2]
+                        if not isinstance(s2, (ast.Assign, ast.AnnAssign)):
+                            return None
+                        t2s = st_targets = (s2.targets if isinstance(s2, ast.Assign) else [s2.target])
+                        if not all(isinstance(t, ast.Name) for t in t2s):
+                            return None
+                        for kk in self.owner_keys(c2, {t.id for t in st_targets}):
+                            out |= self.m.sets[self.m.attrusers[kk]]
+        mu = self.module_users(mod)
+        if mu == ALL:
+            return None
+        self.extra_imp |= mu
+        self.extra_check.add(mod[:-3].replace("/", "."))
         return out
 
     def _stmt_index(self, f, tree):
@@ -1696,6 +1821,7 @@ class Planner:
         why = []
         self.m.touched_setup = set()
         self.full, self.ks = set(), {}
+        self.extra_imp, self.extra_check = set(), set()
         for old_rel, new_rel, old, new, changed, inserted in files:
             rel = old_rel or new_rel
             if rel.endswith(".py") and (rel.startswith("sqlglot/") or rel.startswith("tests/")):
@@ -2000,10 +2126,14 @@ def main():
         job["partial"] = {n: pcfg[n] for n in run if n in pcfg}
         rt_only = all(w.split(":", 2)[1].startswith(("rt", "lambda", "comment-only", "uncovered", "fixture", "other", "annotation"))
                       for w in why if w.count(":") >= 1) if why and why != ["error"] else False
-        if cand != set(range(maps.n)) and not rt_only:
-            imp = planner.import_only_users(overrides) - set(cand)
+        extra_imp = getattr(planner, "extra_imp", set()) if why != ["error"] else set()
+        if cand != set(range(maps.n)) and (not rt_only or extra_imp):
+            imp = planner.import_only_users(overrides)
+            imp = imp if imp == ALL else (imp | extra_imp) - set(cand)
             if imp == ALL or imp:
                 mods = planner.check_modules(overrides)
+                if mods is not None:
+                    mods = sorted(set(mods) | planner.extra_check)
                 if imp == ALL or mods is None:
                     blind = list(blind) + sorted(set(range(maps.n)) - set(cand) if imp == ALL else imp)
                 else:
