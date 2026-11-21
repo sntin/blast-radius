@@ -1904,7 +1904,7 @@ GAMBLE_EVIDENCE = 5      # cheaper candidates that must run (and pass) to leave 
 EXPR_ARG_ATTRS = {"arg_types", "is_var_len_args"}
 RUN_OVERHEAD = 0.12      # fork + import sqlglot in a child, seconds of CPU
 FILE_OVERHEAD = 0.03     # per test module imported
-CPU_SAFETY = float(os.environ.get("BR_CPU_SAFETY", "1.25"))
+CPU_SAFETY = float(os.environ.get("BR_CPU_SAFETY", "0.9"))
 RUN_P_FAIL = float(os.environ.get("BR_RUN_P_FAIL", "0"))  # chance a run candidate fails and is selected anyway
 
 
