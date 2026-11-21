@@ -229,6 +229,12 @@ def run(root, overrides, redirects, tests, out_fd, limits, lazy=(), partial=None
     import syncpool
 
     syncpool.install()
+    try:
+        import main as _main
+
+        _main._single_thread_duckdb()
+    except Exception:
+        pass
     signal.signal(signal.SIGPROF, _alarm)
     partial = partial or {}
     if partial:

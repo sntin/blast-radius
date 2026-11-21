@@ -13,5 +13,5 @@ COPY br /app/br
 COPY data /app/data
 RUN python /app/br/main.py --prepare /app/data/static.pickle \
     && python -m compileall -q /app/br && chmod -R a+rX /app
-ENV SKIP_INTEGRATION=0
+ENV SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_MAX_THREADS=1 VECLIB_MAXIMUM_THREADS=1
 CMD ["python", "/app/br/main.py"]

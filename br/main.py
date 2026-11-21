@@ -27,6 +27,10 @@ DATA = os.environ.get("BR_DATA", "/data")
 MAP = os.environ.get("BR_MAP", os.path.join(HERE, "..", "data", "map.json.gz"))
 PAR = int(os.environ.get("BR_PAR", "2"))
 T0 = time.time()
+# The scorer's host may have many cores; keep numeric libraries from starting (and spinning) one
+# thread per core. CPU seconds count, wall time barely does.
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_MAX_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, "1")
 
 FAMILY_DIRS = ("dialects", "parsers", "generators", "tokenizers", "typing")
 # tests that start a separate interpreter: the in-memory patch cannot reach them
@@ -1094,6 +1098,8 @@ def best_split(nums, secs_s):
     return [w for w in best[0] if w], best[1] / 1000.0
 
 
+GAMBLE_SECONDS = 5.0     # recorded seconds and runner cpu above which a test is not run
+GAMBLE_EVIDENCE = 3      # cheaper candidates that must run (and pass) to leave such a test out
 RUN_OVERHEAD = 0.12      # fork + import sqlglot in a child, seconds of CPU
 FILE_OVERHEAD = 0.03     # per test module imported
 CPU_SAFETY = 1.25
@@ -1141,6 +1147,23 @@ def choose(cand, maps, partial_cfg=None):
 # --------------------------------------------------------------------------- running
 
 
+def _single_thread_duckdb():
+    """duckdb starts a thread per host core for every connection; one is plenty here."""
+    import duckdb
+
+    if getattr(duckdb, "_br_patched", False):
+        return
+    orig = duckdb.connect
+
+    def connect(database=":memory:", read_only=False, config=None, **kw):
+        config = dict(config or {})
+        config.setdefault("threads", 1)
+        return orig(database, read_only, config, **kw)
+
+    duckdb.connect = connect
+    duckdb._br_patched = True
+
+
 HEAVY_TEST_FILES = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -1154,6 +1177,8 @@ def prepare_child_env(heavy=True):
             __import__(m)
         except Exception as e:  # pragma: no cover
             log("preimport failed", m, e)
+    if "duckdb" in sys.modules:
+        _single_thread_duckdb()
     sys.path.insert(0, ROOT)
     sys.path.insert(0, HERE)
     try:
@@ -1247,6 +1272,16 @@ def main():
             cand = set(range(maps.n))
         else:
             pcfg = getattr(planner, "partial_cfg", {})
+        # Very expensive tests are only worth selecting when the change breaks something.
+        # If enough cheaper candidates run and all pass, leave them out; if any fails, select them.
+        gamble = {x for x in cand if maps.seconds[x] >= GAMBLE_SECONDS and maps.cpu.get(x, 99) >= GAMBLE_SECONDS}
+        job["gamble"] = set()
+        if gamble:
+            rest = cand - gamble
+            b2, r2 = choose(rest, maps, pcfg)
+            if len([x for x in r2 if x not in maps.no_run]) >= GAMBLE_EVIDENCE:
+                job["gamble"] = gamble
+                cand = rest
         blind, run = choose(cand, maps, pcfg)
         job["partial"] = {n: pcfg[n] for n in run if n in pcfg}
         job.update(blind=set(blind), run=run, overrides=overrides, redirects=redirects, why=why, lazy=lazy)
@@ -1310,6 +1345,12 @@ def main():
 
     for j in jobs:
         sel = set(j["blind"]) | j["fail"] | (set(j["run"]) - j["done"])
+        if j.get("gamble"):
+            ran_ok = len(j["done"] - j["fail"])
+            if j["fail"] or (set(j["run"]) - j["done"]) or ran_ok < GAMBLE_EVIDENCE:
+                sel |= j["gamble"]
+            else:
+                log(j["cid"], f"left out {len(j['gamble'])} expensive candidates: {ran_ok} cheaper ones passed")
         workers, cost = best_split(sorted(sel), maps.seconds)
         log(j["cid"], f"select={len(sel)} run={len(j['run'])} fail_found={len(j['fail'])} cost={cost:.2f} cpu={j.get('cpu', 0):.2f}")
         sys.stdout.write(json.dumps({"commit": j["cid"], "workers": workers}) + "\n")
