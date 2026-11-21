@@ -77,6 +77,7 @@ def test_importers():
 
 IMPORTERS = test_importers()
 import_exec = {}   # (file, line) -> sqlglot modules whose import ran it
+attr_import = {}   # class attribute key -> sqlglot modules whose import read it
 
 
 def expand_mod(d):
@@ -94,6 +95,10 @@ def expand_mod(d):
             v = sub.pop(k)
             if not k.startswith("MOD:tests/"):
                 # import-time work of a sqlglot module
+                if key == "attr_reads":
+                    for a in v:
+                        attr_import.setdefault(a, set()).add(k[4:])
+                    v = [a for a in v if not a.startswith("sqlglot.expressions:")]
                 sub.setdefault("IMPORT", []).extend(v)
                 continue
             for g in IMPORTERS.get(k[4:], {k[4:]}):
@@ -243,6 +248,7 @@ for (f, l), v in import_exec.items():
     import_exec_out.setdefault(f, {})[str(l)] = ie_sid[key]
 
 out = {
+    "attr_import": {k: sorted(v) for k, v in attr_import.items()},
     "import_exec": {"mods": ie_mods, "sets": ie_sets, "lines": import_exec_out},
     "warm": {f: sorted(v) for f, v in warm.items()},
     "modusers": {m_: sid(v) for m_, v in modusers.items()},

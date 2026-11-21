@@ -275,7 +275,13 @@ def instrument_class_attrs():
                 except (TypeError, AttributeError):
                     pass
     print("instrumented", n, "class attributes", file=sys.stderr)
-    # expression classes: the attributes that describe a node's arguments
+
+
+def instrument_expr_attrs():
+    """Expression classes: the attributes that describe a node's arguments. Installed before
+    the other sqlglot modules are imported, so reads made while they import are recorded
+    under that module's MOD: bucket."""
+    import sqlglot.expressions  # noqa: F401
     from sqlglot.expressions.core import Expr
     m = 0
     stack, seen = [Expr], set()
@@ -343,6 +349,7 @@ def install_import_recorder():
 
 def pytest_sessionstart(session):
     import sqlglot
+    instrument_expr_attrs()
     for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
         try:
             importlib.import_module(m.name)

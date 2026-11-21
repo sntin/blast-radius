@@ -124,6 +124,7 @@ class Maps:
         self.modusers = m.get("modusers", {})
         self.attrusers = m.get("attrusers", {})
         self.attr_global = set(m.get("attr_global", []))
+        self.attr_import = m.get("attr_import", {})
         self.iso = {}
         for i, c in enumerate(m.get("iso") or []):
             n = self.idx2num[i]
@@ -648,12 +649,26 @@ class StmtIndex:
         if tree is None:
             return
         parents = {}
-        for node in ast.walk(tree):
-            for ch in ast.iter_child_nodes(node):
-                parents[ch] = node
+        AST, stmt_t = ast.AST, ast.stmt
+        stmts = []
+        stack = [tree]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, stmt_t):
+                stmts.append(node)
+            for f in node._fields:
+                v = getattr(node, f, None)
+                if type(v) is list:
+                    for x in v:
+                        if isinstance(x, AST):
+                            parents[x] = node
+                            stack.append(x)
+                elif isinstance(v, AST):
+                    parents[v] = node
+                    stack.append(v)
         self.parents = parents
-        for n in ast.walk(tree):
-            if isinstance(n, ast.stmt):
+        for n in stmts:
+            if True:
                 start = n.lineno
                 if getattr(n, "decorator_list", None):
                     start = min([start] + [d.lineno for d in n.decorator_list])
@@ -975,6 +990,26 @@ class Planner:
                     self.full.add(t)
         return out
 
+    def import_parse_users(self, rel):
+        """Modules of the same dialect (file stem) that parse or tokenize SQL while they import,
+        e.g. templates in a class body: a dialect setting change can break that import."""
+        if not hasattr(self, "_parsing_mods"):
+            ie = self.m.import_exec
+            pm = set()
+            for f in ("sqlglot/tokenizer_core.py",):  # tokenizing SQL (the metaclasses also run parser.py/tokens.py code)
+                for si in ie["lines"].get(f, {}).values():
+                    pm.update(ie["mods"][i] for i in ie["sets"][si])
+            self._parsing_mods = pm
+        stem = rel.rsplit("/", 1)[-1]
+        out = set()
+        for mod in sorted(self._parsing_mods):
+            if mod.rsplit("/", 1)[-1] == stem and mod.split("/")[1] in FAMILY_DIRS:
+                mu = self.module_users(mod)
+                if mu == ALL:
+                    return ALL
+                out |= mu
+        return out
+
     def owner_keys(self, classes, attrs):
         """attrusers keys for attributes `attrs` of the changed class chain (innermost first),
         the same chain under every subclass of the outermost class."""
@@ -1290,6 +1325,12 @@ class Planner:
         for k in keys:
             if k in self.m.attrusers:
                 out |= self.m.sets[self.m.attrusers[k]]
+            for mod in self.m.attr_import.get(k, ()):
+                # read while that module imports (e.g. a template parsed in a class body)
+                mu = self.module_users(mod)
+                if mu == ALL:
+                    return ALL
+                out |= mu
         out |= self.lines_tests(rel, cls_node.lineno, cls_node.end_lineno)
         for c in sorted(allc):
             hits = self.s.name_lines(c)
@@ -1502,7 +1543,10 @@ class Planner:
                         nu = self.name_users([nm])
                         if nu != ALL and len(nu) <= 150:
                             out |= nu
-                return out, why + ["meta-derived:" + ",".join(sorted(derived))[:80]]
+                ip = self.import_parse_users(rel)
+                if ip == ALL:
+                    return ALL, why + ["import-parse"]
+                return out | ip, why + ["meta-derived:" + ",".join(sorted(derived))[:80]]
             if names and all(k in self.m.attrusers and k not in self.m.attr_global for k in keys) and not (
                 names & self.s.import_names
             ):
@@ -1527,7 +1571,10 @@ class Planner:
                         nu = self.name_users([nm])
                         if nu != ALL and len(nu) <= 150:
                             out |= nu
-                return out, why + ["attr-readers"]
+                ip = self.import_parse_users(rel)
+                if ip == ALL:
+                    return ALL, why + ["import-parse"]
+                return out | ip, why + ["attr-readers"]
             for c in classes:
                 extra |= self.lines_tests(rel, c.lineno, c.end_lineno)
             for nm in names:
