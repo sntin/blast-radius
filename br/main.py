@@ -1099,13 +1099,14 @@ def best_split(nums, secs_s):
 
 
 GAMBLE_SECONDS = 5.0     # recorded seconds and runner cpu above which a test is not run
-GAMBLE_EVIDENCE = 3      # cheaper candidates that must run (and pass) to leave such a test out
+GAMBLE_P_FAIL = 0.3      # rough chance that a cheaper test fails, which then costs the blind selection
+GAMBLE_EVIDENCE = 5      # cheaper candidates that must run (and pass) to leave such a test out
 RUN_OVERHEAD = 0.12      # fork + import sqlglot in a child, seconds of CPU
 FILE_OVERHEAD = 0.03     # per test module imported
 CPU_SAFETY = 1.25
 
 
-def choose(cand, maps, partial_cfg=None):
+def choose(cand, maps, partial_cfg=None, min_run=0, with_cost=False):
     """Split candidates into blind (always selected) and run (decided by running)."""
     partial_cfg = partial_cfg or {}
     secs = maps.seconds
@@ -1133,14 +1134,18 @@ def choose(cand, maps, partial_cfg=None):
             acc += maps.file_fixed.get(f, FILE_OVERHEAD)
         fixed[i] = acc
     ks = list(range(0, min(len(rest), 40) + 1)) + [len(rest)]
-    for k in sorted(set(ks)):
+    for k in sorted(set(ks) | set(range(max(0, len(rest) - min_run - 1), len(rest) + 1))):
         blind = forced + rest[:k]
         run = rest[k:]
+        if len(run) < min_run and k != 0:
+            continue
         _, bc = best_split(blind, secs)
         rc = (RUN_OVERHEAD + fixed[k] + suffix[k]) if run else 0.0
         c = bc + rc
         if best is None or c < best[0] - 1e-9:
             best = (c, blind, run)
+    if with_cost:
+        return best[1], best[2], best[0]
     return best[1], best[2]
 
 
@@ -1164,6 +1169,7 @@ def _single_thread_duckdb():
     duckdb._br_patched = True
 
 
+GC_FIRST = {"tests/test_generator.py::TestGenerator::test_generator_memory"}
 HEAVY_TEST_FILES = ("tests/test_executor.py", "tests/test_optimizer.py")
 
 
@@ -1206,7 +1212,8 @@ def spawn(job):
             if job["purge"]:
                 for k in stale:
                     del sys.modules[k]
-            tests = [(n, job["ids"][n]) for n in job["run"]]
+            # tests that time gc.collect/tracemalloc go first, before the heap fills up
+            tests = sorted(((n, job["ids"][n]) for n in job["run"]), key=lambda x: (x[1] not in GC_FIRST, x[1]))
             runner.run(ROOT, job["overrides"], job["redirects"], tests, w, job["limits"], job["lazy"], job["partial"])
             os.write(w, b"D\n")
         except BaseException:
@@ -1231,6 +1238,7 @@ def main():
     results = {}
     for cid in commits:
         job = {"cid": cid, "blind": set(), "run": [], "fail": set(), "done": set()}
+        files = []
         jobs.append(job)
         try:
             text = open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="replace").read()
@@ -1276,13 +1284,19 @@ def main():
         # If enough cheaper candidates run and all pass, leave them out; if any fails, select them.
         gamble = {x for x in cand if maps.seconds[x] >= GAMBLE_SECONDS and maps.cpu.get(x, 99) >= GAMBLE_SECONDS}
         job["gamble"] = set()
-        if gamble:
+        # only for changes to sqlglot itself: test helpers and fixtures feed the big tests directly
+        only_lib = bool(files) and all((f[0] or f[1] or "").startswith("sqlglot/") for f in files)
+        if gamble and only_lib:
             rest = cand - gamble
-            b2, r2 = choose(rest, maps, pcfg)
-            if len([x for x in r2 if x not in maps.no_run]) >= GAMBLE_EVIDENCE:
-                job["gamble"] = gamble
-                cand = rest
-        blind, run = choose(cand, maps, pcfg)
+            runnable = [x for x in rest if x not in maps.no_run]
+            if len(runnable) >= GAMBLE_EVIDENCE:
+                _, _, c_no = choose(cand, maps, pcfg, with_cost=True)
+                _, _, c_g = choose(rest, maps, pcfg, min_run=GAMBLE_EVIDENCE, with_cost=True)
+                _, c_giant = best_split(sorted(cand), maps.seconds)
+                if c_g + GAMBLE_P_FAIL * c_giant < c_no:
+                    job["gamble"] = gamble
+                    cand = rest
+        blind, run = choose(cand, maps, pcfg, min_run=GAMBLE_EVIDENCE if job["gamble"] else 0)
         job["partial"] = {n: pcfg[n] for n in run if n in pcfg}
         job.update(blind=set(blind), run=run, overrides=overrides, redirects=redirects, why=why, lazy=lazy)
         log(cid, f"cand={len(cand)} blind={len(blind)} run={len(run)}", ";".join(why)[:300])
@@ -1292,6 +1306,10 @@ def main():
     if any(j["run"] for j in jobs):
         heavy = sum(1 for j in jobs if any(maps.id_of[x].split("::")[0] in HEAVY_TEST_FILES for x in j["run"]))
         prepare_child_env(heavy >= 2)
+    import gc
+
+    gc.collect()
+    gc.freeze()  # children's gc passes (some tests call gc.collect) skip the parent's objects
     log(f"prepared in {time.process_time():.2f}s cpu")
     loaded = set(k for k in sys.modules if k.startswith("sqlglot") or k.startswith("tests"))
     ids = {t["number"]: t["id"] for t in tests}
