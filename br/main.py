@@ -216,6 +216,8 @@ class Source:
             self.hier = d["hier"]
             self.spans = d["spans"]
             self._import_names = d.get("import_names")
+            self._import_sites = d.get("import_sites")
+            self._classfile = d.get("classfile")
 
     def span_of(self, f, line):
         """Innermost statement (start, end) holding line of original file f."""
@@ -234,48 +236,79 @@ class Source:
         """Names read while modules/classes are being built: class bodies, module bodies,
         metaclass methods and __init_subclass__ hooks (Load context, attributes, string keys)."""
         if getattr(self, "_import_names", None) is None:
-            out = set()
+            self._build_import_names()
+        return self._import_names
 
-            def grab(node):
-                for t in ast.walk(node):
-                    if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Load):
-                        out.add(t.id)
-                    elif isinstance(t, ast.Attribute) and isinstance(t.ctx, ast.Load):
-                        out.add(t.attr)
-                    elif isinstance(t, ast.Constant) and isinstance(t.value, str) and t.value.isidentifier():
-                        out.add(t.value)
-
-            def visit(body, in_meta=False):
-                for st in body:
-                    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        if in_meta or st.name == "__init_subclass__":
-                            grab(st)
-                        else:
-                            for d in st.decorator_list + st.args.defaults + st.args.kw_defaults:
-                                if d is not None:
-                                    grab(d)
-                    elif isinstance(st, ast.ClassDef):
-                        meta = any(isinstance(b, ast.Name) and b.id == "type" for b in st.bases)
-                        for b in st.bases + st.decorator_list + [k.value for k in st.keywords]:
-                            grab(b)
-                        visit(st.body, meta)
-                    else:
-                        # executed at import; for assignments only the value side is a read
-                        if isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-                            if st.value is not None:
-                                grab(st.value)
-                            if isinstance(st, ast.AugAssign):
-                                grab(st.target)
-                        else:
-                            grab(st)
-
+    @property
+    def classfile(self):
+        """class name -> files of sqlglot/ defining a class of that name (any nesting)."""
+        if getattr(self, "_classfile", None) is None:
+            out = {}
             for f in self.pyfiles:
                 if f.startswith("sqlglot/"):
                     tree = self.tree(f)
-                    if tree is not None:
-                        visit(tree.body)
-            self._import_names = out
-        return self._import_names
+                    for n in ast.walk(tree) if tree is not None else ():
+                        if isinstance(n, ast.ClassDef):
+                            out.setdefault(n.name, set()).add(f)
+            self._classfile = out
+        return self._classfile
+
+    @property
+    def import_sites(self):
+        """name -> set of sites reading it at import: ("meta", file, line of the metaclass
+        method) or ("other", file, line)."""
+        if getattr(self, "_import_sites", None) is None:
+            self._build_import_names()
+        return self._import_sites
+
+    def _build_import_names(self):
+        sites = {}
+
+        def grab(node, f, site):
+            for t in ast.walk(node):
+                if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Load):
+                    nm = t.id
+                elif isinstance(t, ast.Attribute) and isinstance(t.ctx, ast.Load):
+                    nm = t.attr
+                elif isinstance(t, ast.Constant) and isinstance(t.value, str) and t.value.isidentifier():
+                    nm = t.value
+                else:
+                    continue
+                sites.setdefault(nm, set()).add(site)
+
+        def visit(body, f, in_meta=False):
+            for st in body:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if in_meta:
+                        grab(st, f, ("meta", f, st.lineno))
+                    elif st.name == "__init_subclass__":
+                        grab(st, f, ("meta", f, st.lineno))
+                    else:
+                        for d in st.decorator_list + st.args.defaults + st.args.kw_defaults:
+                            if d is not None:
+                                grab(d, f, ("other", f, st.lineno))
+                elif isinstance(st, ast.ClassDef):
+                    meta = any(isinstance(b, ast.Name) and b.id == "type" for b in st.bases)
+                    for b in st.bases + st.decorator_list + [k.value for k in st.keywords]:
+                        grab(b, f, ("other", f, st.lineno))
+                    visit(st.body, f, meta)
+                else:
+                    # executed at import; for assignments only the value side is a read
+                    if isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                        if st.value is not None:
+                            grab(st.value, f, ("other", f, st.lineno))
+                        if isinstance(st, ast.AugAssign):
+                            grab(st.target, f, ("other", f, st.lineno))
+                    else:
+                        grab(st, f, ("other", f, st.lineno))
+
+        for f in self.pyfiles:
+            if f.startswith("sqlglot/"):
+                tree = self.tree(f)
+                if tree is not None:
+                    visit(tree.body, f)
+        self._import_sites = sites
+        self._import_names = set(sites)
 
     def prepare(self, dest):
         import pickle
@@ -298,7 +331,8 @@ class Source:
             self.span_of(f, 0)
         with open(dest, "wb") as fh:
             pickle.dump({"fwd": fwd, "rev": rev, "core": self.core, "hier": hier, "spans": self.spans,
-                         "import_names": self.import_names}, fh, protocol=4)
+                         "import_names": self.import_names, "import_sites": self.import_sites,
+                         "classfile": self.classfile}, fh, protocol=4)
 
     def read(self, rel):
         if rel not in self.text:
@@ -941,6 +975,375 @@ class Planner:
                     self.full.add(t)
         return out
 
+    def owner_keys(self, classes, attrs):
+        """attrusers keys for attributes `attrs` of the changed class chain (innermost first),
+        the same chain under every subclass of the outermost class."""
+        if not hasattr(self, "_akidx"):
+            idx = {}
+            for k in self.m.attrusers:
+                q = k.split(":", 1)[1]
+                qual, _, a = q.rpartition(".")
+                idx.setdefault((qual, a), []).append(k)
+            self._akidx = idx
+        outer = classes[-1].name
+        inner = ".".join(c.name for c in reversed(classes[:-1]))
+        owners = set()
+        for d in {outer} | self.subclasses(outer):
+            owners.add(d)
+            if inner:
+                owners.add(d + "." + inner)
+        out = []
+        for q in owners:
+            for a in attrs:
+                out.extend(self._akidx.get((q, a), ()))
+        return out
+
+    def import_derivations(self, names, rel, classes):
+        """Import-time reads of class attributes `names` of the changed class chain that can be
+        followed: class bodies elsewhere that copy them into their own attribute of the same
+        name (`X = {**Changed.X, ...}`), and metaclass methods. Returns (attributes derived by
+        metaclasses, qualnames of the copying classes), or None when a read is not understood."""
+        outer = classes[-1].name
+        cf = self.s.classfile
+        # class names defined in several files (nested Parser, Tokenizer, ...) are ambiguous
+        relevant = {c.name for c in classes if len(cf.get(c.name, ())) <= 1} | {
+            c for c in self.subclasses(outer) if len(cf.get(c, ())) <= 1
+        }
+        stem = rel.rsplit("/", 1)[-1][:-3]
+        dial = self.s.tree(f"sqlglot/dialects/{stem}.py")
+        if dial is not None:
+            relevant |= {c.name for c in dial.body if isinstance(c, ast.ClassDef)}
+        extra, meta, own_derived = set(), set(), set()
+        site_list = [site for n in names for site in self.s.import_sites.get(n, ())]
+        handled = set()
+        for _ in range(6):
+            grew = False
+            for site in site_list:
+                if site in handled:
+                    continue
+                if site[0] == "meta":
+                    meta.add(site)
+                    handled.add(site)
+                    continue
+                found = self._class_stmt(site[1], site[2])
+                if found is None:
+                    self.none_why = ("r1", locals().get("site"), locals().get("st")); return None
+                st, chain = found
+                refs = []
+                for t in ast.walk(st):
+                    if isinstance(t, ast.Attribute) and t.attr in names and isinstance(t.ctx, ast.Load):
+                        comps, v = [], t.value
+                        while isinstance(v, ast.Attribute):
+                            comps.append(v.attr)
+                            v = v.value
+                        if isinstance(v, ast.Name):
+                            comps.append(v.id)
+                        refs.append(set(comps))
+                    elif isinstance(t, ast.Name) and t.id in names and isinstance(t.ctx, ast.Load):
+                        # a bare name is the enclosing class body's own attribute (or a module
+                        # global), not the changed class's: only the changed class's own body counts
+                        refs.append(set())
+                    elif (
+                        isinstance(t, ast.Call)
+                        and isinstance(t.func, ast.Name)
+                        and t.func.id in ("getattr", "setattr", "hasattr", "delattr")
+                        and len(t.args) >= 2
+                        and isinstance(t.args[1], ast.Constant)
+                        and t.args[1].value in names
+                    ):
+                        refs.append(None)
+                if not refs:
+                    continue
+                own = bool(chain) and site[1] == rel and chain[0].name == classes[0].name and chain[0].lineno == classes[0].lineno
+                if own:
+                    # part of the changed class's own definition; other attributes it builds
+                    # from the changed one are derived values of the same class
+                    handled.add(site)
+                    if isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                        for t in (st.targets if isinstance(st, ast.Assign) else [st.target]):
+                            for x in ast.walk(t):
+                                if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store) and x.id not in names:
+                                    own_derived.add(x.id)
+                    continue
+                if not any(r is None or r & relevant for r in refs):
+                    continue  # reads that attribute of some other class
+                handled.add(site)
+                tgt = st.targets[0] if isinstance(st, ast.Assign) and len(st.targets) == 1 else None
+                if not chain or not isinstance(tgt, ast.Name) or tgt.id not in names or any(r is None for r in refs):
+                    self.none_why = ("r2", locals().get("site"), locals().get("st")); return None
+                extra.add(".".join(c.name for c in reversed(chain)))
+                if chain[0].name not in relevant and len(cf.get(chain[0].name, ())) <= 1:
+                    relevant.add(chain[0].name)
+                    relevant |= {c for c in self.subclasses(chain[0].name) if len(cf.get(c, ())) <= 1}
+                    grew = True
+            if not grew:
+                break
+        else:
+            self.none_why = ("r3", locals().get("site"), locals().get("st")); return None
+        if own_derived:
+            # their own import-time readers would need following too
+            if own_derived & self.s.import_names - set(names):
+                for n in own_derived:
+                    for site in self.s.import_sites.get(n, ()):
+                        if site not in handled and site[0] != "meta":
+                            self.none_why = ("own-derived", site, None); return None
+        D = set(own_derived)
+        if meta:
+            D2 = self.meta_derived(names, sites=meta)
+            if D2 is None:
+                self.none_why = ("meta", None, None); return None
+            D |= D2
+        if True:
+            if D - own_derived:
+                # metaclass results land on the dialect classes that use these classes
+                stems = {stem} | {f.rsplit("/", 1)[-1][:-3] for c in relevant if len(cf.get(c, ())) == 1
+                                  for f in cf.get(c, ()) if f.split("/")[1] in FAMILY_DIRS}
+                for st_ in stems:
+                    t = self.s.tree(f"sqlglot/dialects/{st_}.py")
+                    for c in t.body if t is not None else ():
+                        if isinstance(c, ast.ClassDef):
+                            extra.add(c.name)
+                            extra |= self.subclasses(c.name)
+        return D, extra
+
+    def _class_stmt(self, f, line):
+        """(statement starting at `line`, enclosing classes innermost first) at class or module
+        level of file f."""
+        tree = self.s.tree(f)
+        if tree is None:
+            self.none_why = ("r5", locals().get("site"), locals().get("st")); return None
+
+        def walk(body, chain):
+            for st in body:
+                if st.lineno == line and not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    return st, chain
+                if isinstance(st, ast.ClassDef) and st.lineno <= line <= st.end_lineno:
+                    r = walk(st.body, [st] + chain)
+                    if r is not None:
+                        return r
+                if isinstance(st, (ast.If, ast.Try)) and st.lineno <= line <= st.end_lineno:
+                    for b in (st.body, st.orelse, getattr(st, "finalbody", [])):
+                        r = walk(b, chain)
+                        if r is not None:
+                            return r
+            self.none_why = ("r6", locals().get("site"), locals().get("st")); return None
+
+        return walk(tree.body, [])
+
+    def meta_derived(self, names, sites=None):
+        """When every import-time read of `names` is in metaclass methods, the class attributes
+        those methods derive from them (taint through locals, control flow and klass.X stores).
+        None when some read is elsewhere or the flow is not understood."""
+        def refs(node):
+            out = set()
+            for t in ast.walk(node):
+                if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Load):
+                    out.add(t.id)
+                elif isinstance(t, ast.Attribute) and isinstance(t.ctx, ast.Load):
+                    out.add(t.attr)
+                elif isinstance(t, ast.Constant) and isinstance(t.value, str) and t.value.isidentifier():
+                    out.add(t.value)
+            return out
+
+        sites_ok = set()
+        pending = set(names)
+        D = set()
+        funcs = {}
+        for it in range(6):
+            new_sites = set()
+            if it == 0 and sites is not None:
+                new_sites = set(sites)
+                pending = set()
+            for n in pending:
+                for site in self.s.import_sites.get(n, ()):
+                    if site[0] != "meta":
+                        self.none_why = ("r7", locals().get("site"), locals().get("st")); return None
+                    new_sites.add(site)
+            for site in new_sites - sites_ok:
+                tree = self.s.tree(site[1])
+                fn = None
+                for x in ast.walk(tree) if tree is not None else ():
+                    if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)) and x.lineno == site[2]:
+                        fn = x
+                        break
+                if fn is None:
+                    self.none_why = ("r8", locals().get("site"), locals().get("st")); return None
+                funcs[site] = fn
+            sites_ok |= new_sites
+            seeds = set(names) | D
+            for fn in funcs.values():
+                T = set()
+
+                def tainted(node):
+                    return bool(refs(node) & (seeds | T))
+
+                def store(target):
+                    for x in ast.walk(target):
+                        if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
+                            T.add(x.id)
+                        elif isinstance(x, ast.Attribute) and isinstance(x.ctx, ast.Store):
+                            D.add(x.attr)
+                            seeds.add(x.attr)
+                        elif isinstance(x, ast.Subscript) and isinstance(x.value, ast.Attribute):
+                            D.add(x.value.attr)
+                            seeds.add(x.value.attr)
+
+                def run(body, ctl):
+                    for st in body:
+                        if isinstance(st, (ast.If, ast.While)):
+                            c = ctl or tainted(st.test)
+                            run(st.body, c)
+                            run(st.orelse, c)
+                        elif isinstance(st, (ast.For, ast.AsyncFor)):
+                            c = ctl or tainted(st.iter)
+                            if c:
+                                store(st.target)
+                            run(st.body, c)
+                            run(st.orelse, c)
+                        elif isinstance(st, (ast.With, ast.AsyncWith)):
+                            run(st.body, ctl or any(tainted(i.context_expr) for i in st.items))
+                        elif isinstance(st, ast.Try):
+                            run(st.body, ctl)
+                            for h in st.handlers:
+                                run(h.body, ctl)
+                            run(st.orelse, ctl)
+                            run(st.finalbody, ctl)
+                        elif ctl or tainted(st):
+                            if isinstance(st, ast.Assign):
+                                for t in st.targets:
+                                    store(t)
+                            elif isinstance(st, (ast.AnnAssign, ast.AugAssign)):
+                                store(st.target)
+                            elif isinstance(st, ast.Expr) and isinstance(st.value, ast.Call):
+                                fnc = st.value.func
+                                if isinstance(fnc, ast.Attribute) and isinstance(fnc.value, ast.Attribute):
+                                    D.add(fnc.value.attr)  # klass.X.update(...)
+                                    seeds.add(fnc.value.attr)
+                                elif isinstance(fnc, ast.Name) and fnc.id == "setattr" and len(st.value.args) >= 2:
+                                    a1 = st.value.args[1]
+                                    if isinstance(a1, ast.Constant) and isinstance(a1.value, str):
+                                        D.add(a1.value)
+                                        seeds.add(a1.value)
+                                    else:
+                                        raise ValueError("dynamic setattr")
+                            elif isinstance(st, (ast.Return, ast.Pass, ast.Expr, ast.Delete, ast.Raise, ast.Assert)):
+                                pass
+                            else:
+                                raise ValueError("unknown statement")
+
+                try:
+                    for _ in range(4):
+                        before = (len(T), len(D))
+                        run(fn.body, False)
+                        if (len(T), len(D)) == before:
+                            break
+                except ValueError:
+                    self.none_why = ("r9", locals().get("site"), locals().get("st")); return None
+            pending = D - set(names)
+            if all(site in sites_ok for n in pending for site in self.s.import_sites.get(n, ())):
+                return D - set(names)
+        self.none_why = ("r10", locals().get("site"), locals().get("st")); return None
+
+    def tokenizer_field_users(self, name):
+        """If Tokenizer setting `name` is only read (in sqlglot) to build the tokenizer core,
+        as `field=self.<name>` in tokens.py, the tests that run core lines reading that field.
+        None when it is read anywhere else."""
+        field = None
+        for f, l in self.s.name_lines(name):
+            if not f.startswith("sqlglot/"):
+                continue
+            line = (self.s.read(f) or "").split("\n")[l - 1]
+            m_ = re.match(r"\s*(\w+)\s*=\s*self\.%s\s*,?\s*$" % re.escape(name), line)
+            if f == "sqlglot/tokens.py" and m_:
+                if field is not None and field != m_.group(1):
+                    return None
+                field = m_.group(1)
+                continue
+            if re.match(r"\s*%s\s*(:[^=]*)?(=|$)" % re.escape(name), line):
+                # a class-level definition; one that reads another class's value was already
+                # ruled out (import-time use)
+                continue
+            return None
+        if field is None:
+            return None
+        out = set()
+        core = "sqlglot/tokenizer_core.py"
+        pat = re.compile(r"\bself\.%s\b(?!\s*=[^=])" % re.escape(field))
+        for i, line in enumerate((self.s.read(core) or "").split("\n"), 1):
+            if pat.search(line):
+                out |= self.m.tests_at(core, i)
+        return out
+
+    def expr_attr_users(self, rel, cls_node, names):
+        """Tests that can see a changed argument spec (arg_types, ...) of expression class C.
+
+        Readers were recorded at run time for C and every subclass, including the attributes
+        derived from it when classes are created (required_args, and subclasses that spread
+        C.arg_types). Code outside the expression modules that reads C.<attr> at import time is
+        found statically: its module-level results are followed to the tests that use them."""
+        cname = cls_node.name
+        allc = {cname} | self.subclasses(cname)
+        keys = [f"sqlglot.expressions:{c}.{a}" for c in allc for a in ("arg_types", "required_args", "is_var_len_args")]
+        if any(k in self.m.attr_global for k in keys):
+            return None
+        out = set()
+        for k in keys:
+            if k in self.m.attrusers:
+                out |= self.m.sets[self.m.attrusers[k]]
+        out |= self.lines_tests(rel, cls_node.lineno, cls_node.end_lineno)
+        for c in sorted(allc):
+            hits = self.s.name_lines(c)
+            if len(hits) > 2000:
+                return None
+            for f, l in hits:
+                if not f.startswith("sqlglot/") or f.startswith("sqlglot/expressions/"):
+                    continue
+                tree = self.s.tree(f)
+                if tree is None:
+                    continue
+                idx = self._stmt_index(f, tree)
+                found = idx.find(l)
+                if found is None:
+                    continue
+                st = found[2]
+                chain = idx.scope_chain(st)
+                if any(isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) for x in chain):
+                    continue  # run time: covered by the recorded readers
+                seg = ast.get_source_segment(self.s.read(f), st) or ""
+                if not any(a in seg for a in names | {"required_args"}):
+                    continue
+                if chain:
+                    # a class attribute built from it at import: users of that module
+                    mu = self.module_users(f)
+                    if mu == ALL:
+                        return ALL
+                    out |= mu
+                    continue
+                tg = set()
+                for t in (st.targets if isinstance(st, ast.Assign) else [getattr(st, "target", None)]):
+                    for x in ast.walk(t) if t is not None else ():
+                        if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
+                            tg.add(x.id)
+                if not tg:
+                    mu = self.module_users(f)
+                    if mu == ALL:
+                        return ALL
+                    out |= mu
+                    continue
+                tg |= derived_names(tree, tg)
+                nu = self.name_users(tg)
+                if nu == ALL:
+                    return ALL
+                out |= nu
+        return out
+
+    def _stmt_index(self, f, tree):
+        if not hasattr(self, "_sidx"):
+            self._sidx = {}
+        if f not in self._sidx:
+            self._sidx[f] = StmtIndex(tree)
+        return self._sidx[f]
+
     def import_exec_users(self, rel, a, b):
         """Tests that import a module whose import runs lines a..b of rel (a broken line there
         breaks that import, e.g. at collection)."""
@@ -1053,6 +1456,16 @@ class Planner:
         classes = [c for c in idx.scope_chain(st) if isinstance(c, ast.ClassDef)]
         if isinstance(st, ast.ClassDef):
             classes.insert(0, st)
+        if (
+            rel.startswith("sqlglot/expressions/")
+            and len(classes) == 1
+            and names
+            and names <= EXPR_ARG_ATTRS
+            and not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ):
+            r = self.expr_attr_users(rel, classes[0], names)
+            if r is not None:
+                return r, why + ["expr-attr"]
         p_ = rel.split("/")
         family_mod = len(p_) == 3 and p_[1] in FAMILY_DIRS and p_[2] not in ("__init__.py", "dialect.py")
         if classes and family_mod and not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -1063,6 +1476,33 @@ class Planner:
             mod = rel[:-3].replace("/", ".")
             qual = ".".join(c.name for c in reversed(classes))
             keys = [f"{mod}:{qual}.{nm}" for nm in names]
+            derived = None
+            if names and names & self.s.import_names:
+                res = self.import_derivations(names, rel, classes)
+                derived = None
+                if res is not None:
+                    derived, extra = res
+                    dkeys = self.owner_keys(classes, names | derived)
+                    if extra:
+                        self.owner_keys(classes, set())  # builds the key index
+                        for q in extra:
+                            for a in names | derived:
+                                dkeys.extend(self._akidx.get((q, a), ()))
+                    if any(k in self.m.attr_global for k in dkeys):
+                        derived = None
+            if derived is not None:
+                # consumed only by metaclass code, into the attributes `derived` of the same
+                # classes: readers of all of them (recorded at run time)
+                out = set()
+                for k in dkeys:
+                    out |= self.m.sets[self.m.attrusers[k]]
+                out |= self.lines_tests(rel, classes[0].lineno, classes[0].end_lineno)
+                for nm in names:
+                    if not self.too_common(nm):
+                        nu = self.name_users([nm])
+                        if nu != ALL and len(nu) <= 150:
+                            out |= nu
+                return out, why + ["meta-derived:" + ",".join(sorted(derived))[:80]]
             if names and all(k in self.m.attrusers and k not in self.m.attr_global for k in keys) and not (
                 names & self.s.import_names
             ):
@@ -1070,6 +1510,16 @@ class Planner:
                 out = set()
                 for k in keys:
                     out |= self.m.sets[self.m.attrusers[k]]
+                narrowed = None
+                if classes[0].name == "Tokenizer":
+                    cov = [self.tokenizer_field_users(nm) for nm in sorted(names)]
+                    if all(c is not None for c in cov):
+                        narrowed = set().union(*cov)
+                if narrowed is not None:
+                    # read only to configure the tokenizer core: tests that read it and run the
+                    # core code that consults that setting
+                    out &= narrowed
+                    why.append("core-field")
                 for c in classes:
                     out |= self.lines_tests(rel, c.lineno, c.end_lineno) if c is classes[0] else set()
                 for nm in names:
@@ -1239,6 +1689,7 @@ def best_split(nums, secs_s):
 GAMBLE_SECONDS = 5.0     # recorded seconds and runner cpu above which a test is not run
 GAMBLE_P_FAIL = 0.3      # rough chance that a cheaper test fails, which then costs the blind selection
 GAMBLE_EVIDENCE = 5      # cheaper candidates that must run (and pass) to leave such a test out
+EXPR_ARG_ATTRS = {"arg_types", "is_var_len_args"}
 RUN_OVERHEAD = 0.12      # fork + import sqlglot in a child, seconds of CPU
 FILE_OVERHEAD = 0.03     # per test module imported
 CPU_SAFETY = float(os.environ.get("BR_CPU_SAFETY", "1.25"))

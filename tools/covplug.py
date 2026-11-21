@@ -225,6 +225,26 @@ class _Rec:
         return self.value
 
 
+class _ORec:
+    """Like _Rec, keyed by the class the attribute is looked up through (so a subclass that
+    inherits the value is recorded under its own name)."""
+    __slots__ = ("value", "attr", "cache")
+
+    def __init__(self, value, attr):
+        self.value = value
+        self.attr = attr
+        self.cache = {}
+
+    def __get__(self, obj, owner=None):
+        if owner is None:
+            owner = type(obj)
+        k = self.cache.get(owner)
+        if k is None:
+            k = self.cache[owner] = f"sqlglot.expressions:{owner.__qualname__}.{self.attr}"
+        attr_reads.setdefault(test_id or cur, set()).add(k)
+        return self.value
+
+
 def instrument_class_attrs():
     """Wrap data attributes of classes defined in dialect-family modules (after import, so
     class creation already consumed them)."""
@@ -255,6 +275,29 @@ def instrument_class_attrs():
                 except (TypeError, AttributeError):
                     pass
     print("instrumented", n, "class attributes", file=sys.stderr)
+    # expression classes: the attributes that describe a node's arguments
+    from sqlglot.expressions.core import Expr
+    m = 0
+    stack, seen = [Expr], set()
+    while stack:
+        cls = stack.pop()
+        if id(cls) in seen:
+            continue
+        seen.add(id(cls))
+        stack.extend(cls.__subclasses__())
+        if not str(cls.__module__).startswith("sqlglot.expressions"):
+            continue
+        for k in EXPR_ATTRS:
+            if k in cls.__dict__ and not isinstance(cls.__dict__[k], (_Rec, _ORec)):
+                try:
+                    setattr(cls, k, _ORec(cls.__dict__[k], k))
+                    m += 1
+                except (TypeError, AttributeError):
+                    pass
+    print("instrumented", m, "expression attributes", file=sys.stderr)
+
+
+EXPR_ATTRS = ("arg_types", "required_args", "is_var_len_args")
 
 
 def install_import_recorder():
