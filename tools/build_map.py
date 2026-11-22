@@ -79,6 +79,8 @@ IMPORTERS = test_importers()
 import_exec = {}   # (file, line) -> sqlglot modules whose import ran it
 attr_import = {}   # class attribute key -> sqlglot modules whose import read it
 dial_sites = {}    # dialect-machinery module -> "file:line" of import-time statements instantiating it
+klook = {}        # dict class attribute -> normalized key -> tests that looked it up
+kunsafe = set()    # dict class attributes walked as a whole, or looked up outside a test
 attr_sites = {}    # expression attribute key -> "file:line" of import-time statements reading it
 imp_users = {}   # sqlglot module -> test files that import it at module level
 import_dialects = {}   # sqlglot module -> modules of dialect machinery instantiated while it imports
@@ -124,6 +126,22 @@ for f in sorted(glob.glob(f"{outdir}/cov-*.json")):
     d = expand_mod(json.load(open(f)))
     for k_, v_ in d.get("attr_sites", {}).items():
         attr_sites.setdefault(k_, set()).update(v_)
+    kunsafe.update(d.get("key_star", ()))
+    for b, items in d.get("key_lookups", {}).items():
+        tg = None
+        if b in num:
+            tg = {num[b]}
+        elif b.startswith("E:"):
+            tid = b[2:].rsplit("#", 1)[0]
+            tg = {num[tid]} if tid in num else None
+        elif b.startswith("SETUP:"):
+            tg = {num[x] for x in num if x.startswith(b[6:] + "::")} or None
+        for it in items:
+            ak, nk = it.split("|", 1)
+            if tg is None or nk == "*":
+                kunsafe.add(ak)
+            else:
+                klook.setdefault(ak, {}).setdefault("*" if nk == "*t" else nk, set()).update(tg)
     for k_, v_ in d.get("dial_sites", {}).items():
         dial_sites.setdefault(k_, set()).update(v_)
     for k, v in d["hits"].items():
@@ -273,6 +291,8 @@ out = {
     "warm": {f: sorted(v) for f, v in warm.items()},
     "modusers": {m_: sid(v) for m_, v in modusers.items()},
     "attrusers": {k_: sid(v) for k_, v in attrusers.items()},
+    "klook": {ak: {nk: sid(v) for nk, v in d_.items()} for ak, d_ in klook.items() if ak not in kunsafe},
+    "kunsafe": sorted(kunsafe),
     "attr_global": sorted(attr_global),
     "ids": ids,
     "seconds": [t["seconds"] for t in tests],

@@ -227,6 +227,227 @@ class _Rec:
         return self.value
 
 
+key_lookups = {}   # bucket -> set of "attrkey|normalized key" looked up in a dict class attribute
+key_star = set()   # dict class attributes iterated, copied, sized or changed somewhere (not key-safe)
+_kd_cache = {}     # id(original dict) -> _KDict standing in for it
+_kquiet = [False]
+
+
+def wrap_dispatch():
+    """Generator dispatch tables are copies of TRANSFORMS cached per class: record lookups on
+    them as lookups on the TRANSFORMS they were built from."""
+    import sqlglot.generator as g
+    orig = g._build_dispatch
+
+    def build(cls):
+        _kquiet[0] = True
+        try:
+            d = orig(cls)
+        finally:
+            _kquiet[0] = False
+        keys = []
+        for c in cls.__mro__:
+            if "TRANSFORMS" in c.__dict__:
+                keys.append(f"{c.__module__}:{c.__qualname__}.TRANSFORMS")
+                break
+        kd = _KDict(d)
+        kd._bk = keys
+        return kd
+
+    g._build_dispatch = build
+    g._DISPATCH_CACHE.clear()
+
+
+def _nk(k):
+    import enum
+    if isinstance(k, str):
+        return "s:" + k
+    if isinstance(k, type):
+        return "c:" + k.__name__
+    if isinstance(k, enum.Enum):
+        return f"e:{type(k).__name__}.{k.name}"
+    try:
+        return "r:" + repr(k)[:200]
+    except Exception:
+        return "r:?"
+
+
+class _KDict(dict):
+    """A dict class attribute that records which keys each test looks up (and whether anything
+    walks the whole dict, which makes key-level selection unsafe for it)."""
+
+    __slots__ = ("_bk",)
+
+    def _rk(self, k):
+        s = key_lookups.setdefault(test_id or cur, set())
+        n = _nk(k)
+        for b in self._bk:
+            s.add(b + "|" + n)
+
+    def _star(self):
+        if _kquiet[0]:
+            return
+        # walked by test code ("*t": that test sees every entry) or by library code ("*": it
+        # may build a cache other tests use, so key-level selection is off for this dict)
+        f = sys._getframe(2)
+        tag = "*t" if f is not None and f.f_code.co_filename.startswith(SRC + "tests/") else "*"
+        s = key_lookups.setdefault(test_id or cur, set())
+        for b in self._bk:
+            s.add(b + "|" + tag)
+
+    def __getitem__(self, k):
+        self._rk(k)
+        return dict.__getitem__(self, k)
+
+    def get(self, k, *d):
+        self._rk(k)
+        return dict.get(self, k, *d)
+
+    def __contains__(self, k):
+        self._rk(k)
+        return dict.__contains__(self, k)
+
+    def setdefault(self, k, *d):
+        self._star()
+        return dict.setdefault(self, k, *d)
+
+    def pop(self, k, *d):
+        self._star()
+        return dict.pop(self, k, *d)
+
+    def __iter__(self):
+        self._star()
+        return dict.__iter__(self)
+
+    def keys(self):
+        self._star()
+        return dict.keys(self)
+
+    def values(self):
+        self._star()
+        return dict.values(self)
+
+    def items(self):
+        self._star()
+        return dict.items(self)
+
+    def copy(self):
+        self._star()
+        return dict.copy(self)
+
+    def __len__(self):
+        self._star()
+        return dict.__len__(self)
+
+    def __eq__(self, o):
+        self._star()
+        return dict.__eq__(self, o)
+
+    def __ne__(self, o):
+        self._star()
+        return dict.__ne__(self, o)
+
+    def __or__(self, o):
+        self._star()
+        return dict.__or__(self, o)
+
+    def __ror__(self, o):
+        self._star()
+        return dict.__ror__(self, o)
+
+    def __setitem__(self, k, v):
+        self._star()
+        return dict.__setitem__(self, k, v)
+
+    def __delitem__(self, k):
+        self._star()
+        return dict.__delitem__(self, k)
+
+    def update(self, *a, **k):
+        self._star()
+        return dict.update(self, *a, **k)
+
+    def popitem(self):
+        self._star()
+        return dict.popitem(self)
+
+    def clear(self):
+        self._star()
+        return dict.clear(self)
+
+    def __reversed__(self):
+        self._star()
+        return dict.__reversed__(self)
+
+    def __reduce_ex__(self, p):
+        self._star()
+        return (dict, (dict(dict.items(self)),))
+
+    __hash__ = None
+
+
+def _kset_cls(base):
+    class _KS(base):
+        """A set class attribute that records which elements each test asks about."""
+
+        __slots__ = ("_bk",)
+
+        _rk = _KDict._rk
+        _star = _KDict._star
+
+        def __contains__(self, k):
+            self._rk(k)
+            return base.__contains__(self, k)
+
+    def star_method(name):
+        orig = getattr(base, name)
+
+        def f(self, *a, **k):
+            self._star()
+            return orig(self, *a, **k)
+        f.__name__ = name
+        return f
+
+    for name in ("__iter__", "__len__", "__eq__", "__ne__", "__or__", "__ror__", "__and__", "__rand__",
+                 "__sub__", "__rsub__", "__xor__", "__rxor__", "__le__", "__lt__", "__ge__", "__gt__",
+                 "union", "intersection", "difference", "symmetric_difference", "issubset", "issuperset",
+                 "isdisjoint", "copy", "__reduce__", "__reduce_ex__"):
+        if hasattr(base, name):
+            setattr(_KS, name, star_method(name))
+    if base is set:
+        for name in ("add", "discard", "remove", "pop", "clear", "update", "__ior__", "__iand__", "__isub__", "__ixor__",
+                     "intersection_update", "difference_update", "symmetric_difference_update"):
+            setattr(_KS, name, star_method(name))
+    _KS.__hash__ = base.__hash__
+    return _KS
+
+
+_KSet = _kset_cls(set)
+_KFSet = _kset_cls(frozenset)
+
+
+def _kdict(v, key):
+    if type(v) in (set, frozenset):
+        kd = _kd_cache.get(id(v))
+        if kd is None:
+            kd = (_KSet if type(v) is set else _KFSet)(v)
+            kd._bk = [key]
+            _kd_cache[id(v)] = kd
+            _kd_cache[id(kd)] = kd
+        elif key not in kd._bk:
+            kd._bk.append(key)
+        return kd
+    kd = _kd_cache.get(id(v))
+    if kd is None:
+        kd = _KDict(v)
+        kd._bk = [key]
+        _kd_cache[id(v)] = kd
+        _kd_cache[id(kd)] = kd
+    elif key not in kd._bk:
+        kd._bk.append(key)
+    return kd
+
+
 class _ORec:
     """Like _Rec, keyed by the class the attribute is looked up through (so a subclass that
     inherits the value is recorded under its own name)."""
@@ -281,6 +502,8 @@ def instrument_class_attrs():
                 if isinstance(v, enum.Enum) and False:
                     continue
                 try:
+                    if type(v) in (dict, set, frozenset) and os.environ.get("BR_KEYS", "1") == "1":
+                        v = _kdict(v, f"{name}:{cls.__qualname__}.{k}")
                     setattr(cls, k, _Rec(v, f"{name}:{cls.__qualname__}.{k}"))
                     n += 1
                 except (TypeError, AttributeError):
@@ -401,6 +624,8 @@ def pytest_sessionstart(session):
         except Exception as e:
             print("import fail", m.name, e, file=sys.stderr)
     instrument_class_attrs()
+    if os.environ.get("BR_KEYS", "1") == "1":
+        wrap_dispatch()
     install_import_recorder()
     import tests.helpers as h
     orig_pairs = h.load_sql_fixture_pairs
@@ -467,6 +692,7 @@ def pytest_sessionfinish(session):
            "jobs": fixture_pos, "yields": yields, "users": {k: sorted(v) for k, v in users.items()},
            "attr_reads": {k: sorted(v) for k, v in attr_reads.items()},
            "attr_sites": {k: sorted(v) for k, v in attr_sites.items()},
+           "key_lookups": {k: sorted(v) for k, v in key_lookups.items()}, "key_star": sorted(key_star),
            "dial_sites": {k: sorted(v) for k, v in dial_sites.items()}}
     with _orig_open(f"/out/cov-{wid}.json", "w") as f:
         json.dump(out, f)

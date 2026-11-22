@@ -124,6 +124,8 @@ class Maps:
         self.modusers = m.get("modusers", {})
         self.attrusers = m.get("attrusers", {})
         self.attr_global = set(m.get("attr_global", []))
+        self.klook = m.get("klook", {})
+        self.kunsafe = set(m.get("kunsafe", []))
         self.attr_import = m.get("attr_import", {})
         self.attr_sites = m.get("attr_sites", {})
         self.dial_sites = m.get("dial_sites", {})
@@ -939,6 +941,7 @@ class Planner:
             return self.module_users(rel), ["deleted"]
 
         old_tree = self.s.tree(rel)
+        self._new_tree = new_tree
         if old_tree is None or new_tree is None:
             return self.module_users(rel), ["unparsable"]
         idx = self.stmt_index(rel)
@@ -1090,6 +1093,144 @@ class Planner:
                 if mu == ALL:
                     return ALL
                 out |= mu
+        return out
+
+    @staticmethod
+    def _key_forms(k):
+        """Normalized runtime forms a dict-literal key can take (see covplug._nk); None if unknown."""
+        if isinstance(k, ast.Constant):
+            v = k.value
+            return {"s:" + v} if isinstance(v, str) else {"r:" + repr(v)}
+        if isinstance(k, ast.Attribute) and isinstance(k.value, (ast.Name, ast.Attribute)):
+            owner = k.value.id if isinstance(k.value, ast.Name) else k.value.attr
+            return {"c:" + k.attr, f"e:{owner}.{k.attr}"}
+        return None
+
+    def _dict_entries(self, node):
+        """{key source: (forms, value dump)} of a dict literal, and the dumps of its ** spreads."""
+        ents, spreads = {}, []
+        for k, v in zip(node.keys, node.values):
+            if k is None:
+                spreads.append(ast.dump(v))
+                continue
+            forms = self._key_forms(k)
+            if forms is None:
+                return None
+            ents[ast.dump(k)] = (forms, ast.dump(v))
+        return ents, spreads
+
+    def _set_elems(self, node):
+        """(skeleton, {element dump: forms}) of a set expression made of set literals combined
+        with | - & ^ and other operands; None if an element's runtime form is unknown."""
+        elems = {}
+
+        def walk(n):
+            if isinstance(n, ast.Set):
+                for e in n.elts:
+                    if isinstance(e, ast.Starred):
+                        return None
+                    forms = self._key_forms(e)
+                    if forms is None:
+                        return None
+                    elems[ast.dump(e)] = forms
+                return "SET"
+            if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.BitOr, ast.Sub, ast.BitAnd, ast.BitXor)):
+                l, r = walk(n.left), walk(n.right)
+                if l is None or r is None:
+                    return None
+                return f"({l} {type(n.op).__name__} {r})"
+            return ast.dump(n)
+
+        sk = walk(node)
+        if sk is None or "SET" not in sk:
+            return None
+        return sk, elems
+
+    def key_narrow(self, rel, st, classes, names):
+        """A change to some entries of a dict class attribute: the tests that looked up those
+        keys in it (or in the copies other classes make of it at import), recorded per test.
+        None when that is not known to be safe (walked as a whole, derived at import, ...)."""
+        if not self.m.klook or len(names) != 1 or not classes:
+            return None
+        if not isinstance(st, (ast.Assign, ast.AnnAssign)) or not isinstance(st.value, (ast.Dict, ast.Set, ast.BinOp)):
+            return None
+        tg = st.targets if isinstance(st, ast.Assign) else [st.target]
+        if len(tg) != 1 or not isinstance(tg[0], ast.Name):
+            return None
+        nm = tg[0].id
+        new_tree = getattr(self, "_new_tree", None)
+        if new_tree is None:
+            return None
+        # the same statement in the new version: same class chain, same target
+        chain = [c.name for c in reversed(classes)]
+        body = new_tree.body
+        for cn in chain:
+            nxt = [x for x in body if isinstance(x, ast.ClassDef) and x.name == cn]
+            if len(nxt) != 1:
+                return None
+            body = nxt[0].body
+        cands = [x for x in body if isinstance(x, (ast.Assign, ast.AnnAssign))
+                 and [t.id for t in (x.targets if isinstance(x, ast.Assign) else [x.target]) if isinstance(t, ast.Name)] == [nm]]
+
+        def keeps_keys(x):
+            # `X = {k: f(v) for k, v in X.items() if ...}`: same keys (some dropped), per-key values
+            v = x.value
+            if not (isinstance(v, ast.DictComp) and len(v.generators) == 1 and isinstance(v.key, ast.Name)):
+                return False
+            g = v.generators[0]
+            it = g.iter
+            return (isinstance(g.target, ast.Tuple) and len(g.target.elts) == 2 and isinstance(g.target.elts[0], ast.Name)
+                    and g.target.elts[0].id == v.key.id and isinstance(it, ast.Call) and not it.args
+                    and isinstance(it.func, ast.Attribute) and it.func.attr == "items"
+                    and isinstance(it.func.value, ast.Name) and it.func.value.id == nm)
+
+        if isinstance(st.value, ast.Dict):
+            lits = [x for x in cands if isinstance(x.value, ast.Dict)]
+            if len(lits) != 1 or not all(x is lits[0] or keeps_keys(x) for x in cands) or cands[0] is not lits[0]:
+                return None
+            a, b = self._dict_entries(st.value), self._dict_entries(lits[0].value)
+            if a is None or b is None or a[1] != b[1]:
+                return None
+            changed = set()
+            for k in set(a[0]) | set(b[0]):
+                if a[0].get(k) != b[0].get(k):
+                    changed |= (a[0].get(k) or b[0].get(k))[0]
+        else:
+            # a set literal, or set algebra on other attributes and set literals
+            if len(cands) != 1:
+                return None
+            a, b = self._set_elems(st.value), self._set_elems(cands[0].value)
+            if a is None or b is None or a[0] != b[0]:
+                return None
+            changed = set()
+            for k in set(a[1]) ^ set(b[1]):
+                changed |= (a[1].get(k) or b[1].get(k))
+        if not changed:
+            return None
+        akeys = list(self.owner_keys(classes, {nm}))
+        if names & self.s.import_names:
+            res = self.import_derivations(names, rel, classes)
+            if res is None or res[0]:
+                return None  # read at import in a way we cannot follow, or derived by a metaclass
+            extra = res[1]
+            if extra:
+                self.owner_keys(classes, set())
+                for q in extra:
+                    akeys.extend(self._akidx.get((q, nm), ()))
+        mod = rel[:-3].replace("/", ".")
+        own = f"{mod}:{'.'.join(chain)}.{nm}"
+        if own not in akeys:
+            akeys.append(own)
+        out = set()
+        for ak in akeys:
+            if ak in self.m.kunsafe or ak in self.m.attr_global:
+                return None
+            d = self.m.klook.get(ak)
+            if not d:
+                continue  # never looked up by a test
+            for f in changed | {"*"}:
+                if f in d:
+                    out |= self.m.sets[d[f]]
         return out
 
     def owner_keys(self, classes, attrs):
@@ -1681,6 +1822,12 @@ class Planner:
             mod = rel[:-3].replace("/", ".")
             qual = ".".join(c.name for c in reversed(classes))
             keys = [f"{mod}:{qual}.{nm}" for nm in names]
+            kn = self.key_narrow(rel, st, classes, names)
+            if kn is not None:
+                ip = self.import_parse_users(rel)
+                if ip == ALL:
+                    return ALL, why + ["import-parse"]
+                return kn | ip, why + ["dict-keys"]
             derived = None
             if names and names & self.s.import_names:
                 res = self.import_derivations(names, rel, classes)
