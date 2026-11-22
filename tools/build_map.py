@@ -81,6 +81,8 @@ attr_import = {}   # class attribute key -> sqlglot modules whose import read it
 dial_sites = {}    # dialect-machinery module -> "file:line" of import-time statements instantiating it
 klook = {}        # dict class attribute -> normalized key -> tests that looked it up
 attr_known = set()
+missing = {}         # "Class|arg" -> tests that validated a Class instance missing arg
+missing_global = set()
 kempty = set()     # dict class attributes whose emptiness is asked outside a test
 kunsafe = set()    # dict class attributes walked as a whole, or looked up outside a test
 attr_sites = {}    # expression attribute key -> "file:line" of import-time statements reading it
@@ -130,6 +132,20 @@ for f in sorted(glob.glob(f"{outdir}/cov-*.json")):
         attr_sites.setdefault(k_, set()).update(v_)
     kunsafe.update(d.get("key_star", ()))
     attr_known.update(d.get("attr_known", ()))
+    for b, items in d.get("missing_args", {}).items():
+        tg = None
+        if b in num:
+            tg = {num[b]}
+        elif b.startswith("E:"):
+            tid = b[2:].rsplit("#", 1)[0]
+            tg = {num[tid]} if tid in num else None
+        elif b.startswith("SETUP:"):
+            tg = {num[x] for x in num if x.startswith(b[6:] + "::")} or None
+        for it in items:
+            if tg is None:
+                missing_global.add(it)
+            else:
+                missing.setdefault(it, set()).update(tg)
     for b, items in d.get("key_lookups", {}).items():
         tg = None
         if b in num:
@@ -300,6 +316,8 @@ out = {
     "kunsafe": sorted(kunsafe),
     "kempty": sorted(kempty),
     "attr_known": sorted(attr_known),
+    "missing": {k_: sid(v) for k_, v in missing.items()},
+    "missing_global": sorted(missing_global),
     "attr_global": sorted(attr_global),
     "ids": ids,
     "seconds": [t["seconds"] for t in tests],

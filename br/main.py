@@ -126,6 +126,8 @@ class Maps:
         self.attrusers = m.get("attrusers", {})
         self.attr_global = set(m.get("attr_global", []))
         self.attr_known = set(m.get("attr_known", []))
+        self.missing = m.get("missing", {})
+        self.missing_global = set(m.get("missing_global", []))
         self.klook = m.get("klook", {})
         self.kunsafe = set(m.get("kunsafe", []))
         self.kempty = set(m.get("kempty", []))
@@ -747,6 +749,12 @@ class StmtIndex:
             p = self.parents.get(p)
         return out
 
+
+
+def idx_parent_class(tree, cls_node):
+    """The top-level class of `tree` with cls_node's name, if exactly one."""
+    hits = [x for x in tree.body if isinstance(x, ast.ClassDef) and x.name == cls_node.name]
+    return hits[0] if len(hits) == 1 else None
 
 
 def ast_diff(a, b, field=None, parent=None):
@@ -1656,6 +1664,84 @@ class Planner:
                 out |= self.m.tests_at(core, i)
         return out
 
+    def required_flag_users(self, rel, st, cls_node, names):
+        """`arg_types = {...}` of an expression class where only the True/False flags changed
+        (same keys, same order). The flags are read once, by Expr.__init_subclass__, into
+        required_args, which only error_messages reads: the tests that validated an instance of
+        that class, of a subclass, or of a class spreading its arg_types (recorded per class)."""
+        if names != {"arg_types"} or not isinstance(st, ast.Assign) or not isinstance(st.value, ast.Dict):
+            return None
+        new_tree = getattr(self, "_new_tree", None)
+        if new_tree is None or idx_parent_class(new_tree, cls_node) is None:
+            return None
+        nb = idx_parent_class(new_tree, cls_node)
+        cands = [x for x in nb.body if isinstance(x, ast.Assign) and len(x.targets) == 1
+                 and isinstance(x.targets[0], ast.Name) and x.targets[0].id == "arg_types"]
+        if len(cands) != 1 or not isinstance(cands[0].value, ast.Dict):
+            return None
+        a, b = st.value, cands[0].value
+        if len(a.keys) != len(b.keys) or not self.m.missing:
+            return None
+        flipped = set()
+        for ka, kb, va, vb in zip(a.keys, b.keys, a.values, b.values):
+            if ka is None or kb is None:
+                if ka is None and kb is None and ast.dump(va) == ast.dump(vb):
+                    continue
+                return None
+            if ast.dump(ka) != ast.dump(kb):
+                return None
+            for v in (va, vb):
+                if not (isinstance(v, ast.Constant) and isinstance(v.value, bool)):
+                    return None
+            if va.value != vb.value:
+                if not (isinstance(ka, ast.Constant) and isinstance(ka.value, str)):
+                    return None
+                flipped.add(ka.value)
+        if not flipped:
+            return None
+        cname = cls_node.name
+        allc = {cname} | self.subclasses(cname)
+        # classes whose own arg_types spread or copy this one's, and their subclasses
+        for f, l in self.s.name_lines(cname):
+            if not f.startswith("sqlglot/"):
+                continue
+            src_ = self.s.read(f) or ""
+            line = src_.split("\n")[l - 1] if 0 < l <= src_.count("\n") + 1 else ""
+            if f"{cname}.arg_types" not in line:
+                continue
+            tree = self.s.tree(f)
+            idx = self._stmt_index(f, tree) if tree is not None else None
+            found = idx.find(l) if idx is not None else None
+            if found is None:
+                return None
+            chain = [c for c in idx.scope_chain(found[2]) if isinstance(c, ast.ClassDef)]
+            if not chain or any(isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                                for x in idx.scope_chain(found[2])):
+                return None
+            allc |= {chain[0].name} | self.subclasses(chain[0].name)
+        keys = [f"sqlglot.expressions:{c}.required_args" for c in allc]
+        if any(k in self.m.attr_global for k in keys):
+            return None
+        out = set()
+        for c in allc:
+            for k in flipped:
+                mk = f"{c}|{k}"
+                if mk in self.m.missing_global:
+                    return None
+                if mk in self.m.missing:
+                    out |= self.m.sets[self.m.missing[mk]]
+        for k in keys:
+            for mod in self.m.attr_import.get(k, ()):
+                # validated while that module imports (a template parsed in a class body)
+                su = self.attr_site_users(k, mod)
+                if su is None:
+                    su = self.module_users(mod)
+                    if su == ALL:
+                        return ALL
+                out |= su
+        out |= self.lines_tests(rel, cls_node.lineno, cls_node.end_lineno)
+        return out
+
     def expr_attr_users(self, rel, cls_node, names):
         """Tests that can see a changed argument spec (arg_types, ...) of expression class C.
 
@@ -1943,6 +2029,9 @@ class Planner:
             and names <= EXPR_ARG_ATTRS
             and not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
         ):
+            r = self.required_flag_users(rel, st, classes[0], names)
+            if r is not None:
+                return r, why + ["expr-required"]
             r = self.expr_attr_users(rel, classes[0], names)
             if r is not None:
                 return r, why + ["expr-attr"]

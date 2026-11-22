@@ -208,6 +208,7 @@ class _ModFinder:
 sys.meta_path.insert(0, _ModFinder())
 
 
+missing_args = {}  # bucket -> "Class|arg" for arg_types keys missing when an instance was validated
 attr_reads = {}   # bucket -> set of "module:qualname.attr"
 dial_sites = {}   # dialect-machinery module -> "file:line" of import-time statements instantiating it
 attr_sites = {}   # expression attr key -> "file:line" of import-time statements reading it
@@ -232,6 +233,32 @@ key_lookups = {}   # bucket -> set of "attrkey|normalized key" looked up in a di
 key_star = set()   # dict class attributes iterated, copied, sized or changed somewhere (not key-safe)
 _kd_cache = {}     # id(original dict) -> _KDict standing in for it
 _kquiet = [False]
+
+
+def wrap_error_messages():
+    """Record which arg_types keys were missing on each validated expression: a change to a
+    key's required flag only changes the errors of instances missing that key."""
+    from sqlglot.expressions.core import Expression as Expr
+    orig = Expr.error_messages
+
+    def raw_arg_types(cls):
+        for c in cls.__mro__:
+            if "arg_types" in c.__dict__:
+                v = c.__dict__["arg_types"]
+                return getattr(v, "value", v) if isinstance(v, (_Rec, _ORec)) else v
+        return {}
+
+    def error_messages(self, args=None):
+        cls = type(self)
+        s = missing_args.setdefault(test_id or cur, set())
+        a = self.args
+        for k in raw_arg_types(cls):
+            v = a.get(k)
+            if v is None or (isinstance(v, list) and not v):
+                s.add(f"{cls.__name__}|{k}")
+        return orig(self, args)
+
+    Expr.error_messages = error_messages
 
 
 def wrap_dispatch():
@@ -643,6 +670,7 @@ def pytest_sessionstart(session):
     instrument_class_attrs()
     if os.environ.get("BR_KEYS", "1") == "1":
         wrap_dispatch()
+    wrap_error_messages()
     install_import_recorder()
     import tests.helpers as h
     orig_pairs = h.load_sql_fixture_pairs
@@ -711,6 +739,7 @@ def pytest_sessionfinish(session):
            "attr_sites": {k: sorted(v) for k, v in attr_sites.items()},
            "key_lookups": {k: sorted(v) for k, v in key_lookups.items()}, "key_star": sorted(key_star),
            "attr_known": sorted(attr_known),
+           "missing_args": {k: sorted(v) for k, v in missing_args.items()},
            "dial_sites": {k: sorted(v) for k, v in dial_sites.items()}}
     with _orig_open(f"/out/cov-{wid}.json", "w") as f:
         json.dump(out, f)
