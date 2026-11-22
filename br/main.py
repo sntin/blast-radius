@@ -1973,6 +1973,8 @@ class Planner:
                 rt = rt | ie
             if not rt:
                 why.append(f"uncovered:{a_}")
+            if not iem:
+                self.rt_spans.append((rel, scope.lineno, scope.end_lineno))
             return rt, why + [f"rt:{a_}-{b_}"]
         # import-time change
         st = self.stmt_of(idx, node)
@@ -2195,6 +2197,7 @@ class Planner:
         why = []
         self.m.touched_setup = set()
         self.full, self.ks = set(), {}
+        self.rt_spans = []
         self.extra_imp, self.extra_check = set(), set()
         for old_rel, new_rel, old, new, changed, inserted in files:
             rel = old_rel or new_rel
@@ -2276,6 +2279,11 @@ TOKENIZER_KEY_DERIVED = {"_KEYWORD_TRIE", "_COMMENTS", "SUPPORTS_COLUMN_JOIN_MAR
 KEYWORD_WORD = re.compile(r"^s:[A-Za-z0-9_]+$")
 GAMBLE_SECONDS = 5.0     # recorded seconds and runner cpu above which a test is not run
 GAMBLE_P_FAIL = 0.3      # rough chance that a cheaper test fails, which then costs the blind selection
+PATH_K = int(os.environ.get("BR_PATH_K", "2"))           # tests per distinct path run as evidence
+PATH_MIN = int(os.environ.get("BR_PATH_MIN", "20"))       # candidates that make a runtime change wide
+PATH_COST = float(os.environ.get("BR_PATH_COST", "4"))    # blind cost (simulated s) worth gambling on
+PATH_GROUPS = int(os.environ.get("BR_PATH_GROUPS", "3"))  # distinct paths needed before gambling
+RT_WHY = re.compile(r":(rt:\d+-\d+|comment-only|docstring-only)$")
 GAMBLE_EVIDENCE = 5      # cheaper candidates that must run (and pass) to leave such a test out
 EXPR_ARG_ATTRS = {"arg_types", "is_var_len_args"}
 RUN_OVERHEAD = 0.12      # fork + import sqlglot in a child, seconds of CPU
@@ -2502,6 +2510,34 @@ def main():
                     job["gamble"] = gamble
                     cand = rest
         blind, run = choose(cand, maps, pcfg, min_run=GAMBLE_EVIDENCE if job["gamble"] else 0)
+        spans = getattr(planner, "rt_spans", [])
+        if (PATH_K and only_lib and spans and why and all(RT_WHY.search(w) for w in why)
+                and len(cand) >= PATH_MIN and best_split(sorted(blind), maps.seconds)[1] >= PATH_COST):
+            # Wide runtime change, nothing failed yet: group the blind candidates by the lines of
+            # the changed functions they ran, run the cheapest PATH_K of every group, and leave
+            # the rest out if all of those pass.
+            groups = {}
+            lines = [(r_, L) for r_, a_, b_ in spans for L in range(a_, b_ + 1)]
+            hits = {}
+            for r_, L in lines:
+                for x in maps.tests_at(r_, L):
+                    hits.setdefault(x, []).append((r_, L))
+            for x in blind:
+                if x in maps.no_run:
+                    continue
+                groups.setdefault(tuple(hits.get(x, ())), []).append(x)
+            ev = set()
+            for g in groups.values():
+                ev |= set(sorted(g, key=lambda x: (maps.cpu.get(x, maps.seconds[x] * 1.5), x))[:PATH_K])
+            rest = set(blind) - ev - set(maps.no_run)
+            # one path through a tiny function says nothing about the data the tests feed it
+            if len(groups) >= PATH_GROUPS and rest and len(ev) + len(run) >= GAMBLE_EVIDENCE:
+                ev_cpu = sum(maps.cpu.get(x, maps.seconds[x] * 1.5) for x in ev)
+                if ev_cpu * CPU_SAFETY < best_split(sorted(blind), maps.seconds)[1] - best_split(sorted(set(blind) - rest), maps.seconds)[1]:
+                    job["gamble"] = set(job["gamble"]) | rest
+                    run = list(run) + sorted(ev)
+                    blind = sorted(set(blind) - rest - ev)
+                    log(cid, f"path: {len(groups)} paths, running {len(ev)}, {len(rest)} left out if they pass")
         job["partial"] = {n: pcfg[n] for n in run if n in pcfg}
         rt_only = all(w.split(":", 2)[1].startswith(("rt", "lambda", "comment-only", "docstring-only", "uncovered", "fixture", "other", "annotation"))
                       for w in why if w.count(":") >= 1) if why and why != ["error"] else False
