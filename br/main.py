@@ -1210,8 +1210,11 @@ class Planner:
         akeys = list(self.owner_keys(classes, {nm}))
         if names & self.s.import_names:
             res = self.import_derivations(names, rel, classes)
-            if res is None or res[0]:
-                return None  # read at import in a way we cannot follow, or derived by a metaclass
+            if res is None:
+                return None  # read at import in a way we cannot follow
+            if res[0] and not (nm == "KEYWORDS" and set(res[0]) <= TOKENIZER_KEY_DERIVED
+                               and all(KEYWORD_WORD.match(f) for f in changed)):
+                return None  # derived by a metaclass
             extra = res[1]
             if extra:
                 self.owner_keys(classes, set())
@@ -2045,6 +2048,11 @@ def best_split(nums, secs_s):
     return [w for w in best[0] if w], best[1] / 1000.0
 
 
+# The tokenizer metaclass derives these from KEYWORDS, but only from keys holding a space or a
+# single-token character ("/*+" hint start, "(+)" join mark, multi-word keywords): entries keyed
+# by a plain word reach tests only through lookups in the tokenizer, which are recorded per test.
+TOKENIZER_KEY_DERIVED = {"_KEYWORD_TRIE", "_COMMENTS", "SUPPORTS_COLUMN_JOIN_MARKS"}
+KEYWORD_WORD = re.compile(r"^s:[A-Za-z0-9_]+$")
 GAMBLE_SECONDS = 5.0     # recorded seconds and runner cpu above which a test is not run
 GAMBLE_P_FAIL = 0.3      # rough chance that a cheaper test fails, which then costs the blind selection
 GAMBLE_EVIDENCE = 5      # cheaper candidates that must run (and pass) to leave such a test out
