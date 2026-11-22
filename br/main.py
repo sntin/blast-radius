@@ -2279,7 +2279,7 @@ TOKENIZER_KEY_DERIVED = {"_KEYWORD_TRIE", "_COMMENTS", "SUPPORTS_COLUMN_JOIN_MAR
 KEYWORD_WORD = re.compile(r"^s:[A-Za-z0-9_]+$")
 GAMBLE_SECONDS = 5.0     # recorded seconds and runner cpu above which a test is not run
 GAMBLE_P_FAIL = 0.3      # rough chance that a cheaper test fails, which then costs the blind selection
-GAMBLE_ALL_RUN = os.environ.get("BR_GAMBLE_ALL_RUN", "0") == "1"
+GAMBLE_ALL_RUN = os.environ.get("BR_GAMBLE_ALL_RUN", "1") == "1"
 GAMBLE_SAME_PATH = int(os.environ.get("BR_GAMBLE_SAME_PATH", "2"))
 GAMBLE_EVIDENCE = 5      # cheaper candidates that must run (and pass) to leave such a test out
 EXPR_ARG_ATTRS = {"arg_types", "is_var_len_args"}
