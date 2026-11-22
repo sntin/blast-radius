@@ -1900,6 +1900,9 @@ def best_split(nums, secs_s):
 
 GAMBLE_SECONDS = 5.0     # recorded seconds and runner cpu above which a test is not run
 GAMBLE_P_FAIL = 0.3      # rough chance that a cheaper test fails, which then costs the blind selection
+BROAD_K = int(os.environ.get("BR_BROAD_K", "2"))          # tests per file run as evidence for a broad set
+BROAD_MIN = int(os.environ.get("BR_BROAD_MIN", "40"))     # candidates that make a set broad
+BROAD_COST = float(os.environ.get("BR_BROAD_COST", "5"))  # blind cost (simulated s) worth gambling on
 GAMBLE_EVIDENCE = 5      # cheaper candidates that must run (and pass) to leave such a test out
 EXPR_ARG_ATTRS = {"arg_types", "is_var_len_args"}
 RUN_OVERHEAD = 0.12      # fork + import sqlglot in a child, seconds of CPU
@@ -2126,6 +2129,21 @@ def main():
                     job["gamble"] = gamble
                     cand = rest
         blind, run = choose(cand, maps, pcfg, min_run=GAMBLE_EVIDENCE if job["gamble"] else 0)
+        if only_lib and BROAD_K and len(cand) >= BROAD_MIN and best_split(sorted(blind), maps.seconds)[1] >= BROAD_COST:
+            # Broad candidate sets (a setting or import many tests read) rarely break anything:
+            # run the cheapest few tests of every test file and, if all pass, leave the rest out.
+            byf = {}
+            for x in blind:
+                if x not in maps.no_run:
+                    byf.setdefault(maps.id_of[x].split("::")[0], []).append(x)
+            ev = set()
+            for f_, xs in byf.items():
+                ev |= set(sorted(xs, key=lambda x: (maps.cpu.get(x, maps.seconds[x] * 1.5), x))[:BROAD_K])
+            if len(ev) + len(run) >= GAMBLE_EVIDENCE:
+                job["gamble"] = set(job["gamble"]) | (set(blind) - ev)
+                run = list(run) + sorted(ev)
+                blind = []
+                log(cid, f"broad: running {len(ev)} file samples, {len(job['gamble'])} left out if they pass")
         job["partial"] = {n: pcfg[n] for n in run if n in pcfg}
         rt_only = all(w.split(":", 2)[1].startswith(("rt", "lambda", "comment-only", "uncovered", "fixture", "other", "annotation"))
                       for w in why if w.count(":") >= 1) if why and why != ["error"] else False
