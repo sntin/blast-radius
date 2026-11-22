@@ -227,6 +227,7 @@ class _Rec:
         return self.value
 
 
+attr_known = set()  # class attributes wrapped by instrument_class_attrs (absent from reads = never read)
 key_lookups = {}   # bucket -> set of "attrkey|normalized key" looked up in a dict class attribute
 key_star = set()   # dict class attributes iterated, copied, sized or changed somewhere (not key-safe)
 _kd_cache = {}     # id(original dict) -> _KDict standing in for it
@@ -520,6 +521,7 @@ def instrument_class_attrs():
                     if type(v) in (dict, set, frozenset) and os.environ.get("BR_KEYS", "1") == "1":
                         v = _kdict(v, f"{name}:{cls.__qualname__}.{k}")
                     setattr(cls, k, _Rec(v, f"{name}:{cls.__qualname__}.{k}"))
+                    attr_known.add(f"{name}:{cls.__qualname__}.{k}")
                     n += 1
                 except (TypeError, AttributeError):
                     pass
@@ -708,6 +710,7 @@ def pytest_sessionfinish(session):
            "attr_reads": {k: sorted(v) for k, v in attr_reads.items()},
            "attr_sites": {k: sorted(v) for k, v in attr_sites.items()},
            "key_lookups": {k: sorted(v) for k, v in key_lookups.items()}, "key_star": sorted(key_star),
+           "attr_known": sorted(attr_known),
            "dial_sites": {k: sorted(v) for k, v in dial_sites.items()}}
     with _orig_open(f"/out/cov-{wid}.json", "w") as f:
         json.dump(out, f)

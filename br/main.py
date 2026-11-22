@@ -125,6 +125,7 @@ class Maps:
         self.modusers = m.get("modusers", {})
         self.attrusers = m.get("attrusers", {})
         self.attr_global = set(m.get("attr_global", []))
+        self.attr_known = set(m.get("attr_known", []))
         self.klook = m.get("klook", {})
         self.kunsafe = set(m.get("kunsafe", []))
         self.kempty = set(m.get("kempty", []))
@@ -1991,13 +1992,14 @@ class Planner:
                 if ip == ALL:
                     return ALL, why + ["import-parse"]
                 return out | ip, why + ["meta-derived:" + ",".join(sorted(derived))[:80]]
-            if names and all(k in self.m.attrusers and k not in self.m.attr_global for k in keys) and not (
-                names & self.s.import_names
-            ):
-                # every reader of this attribute was seen at run time: those tests, plus code of the class
+            if names and all((k in self.m.attrusers or k in self.m.attr_known) and k not in self.m.attr_global
+                             for k in keys) and not (names & self.s.import_names):
+                # every reader of this attribute was seen at run time (an instrumented attribute
+                # with none was never read): those tests, plus code of the class
                 out = set()
                 for k in keys:
-                    out |= self.m.sets[self.m.attrusers[k]]
+                    if k in self.m.attrusers:
+                        out |= self.m.sets[self.m.attrusers[k]]
                 narrowed = None
                 if classes[0].name == "Tokenizer":
                     cov = [self.tokenizer_field_users(nm) for nm in sorted(names)]

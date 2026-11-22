@@ -80,6 +80,7 @@ import_exec = {}   # (file, line) -> sqlglot modules whose import ran it
 attr_import = {}   # class attribute key -> sqlglot modules whose import read it
 dial_sites = {}    # dialect-machinery module -> "file:line" of import-time statements instantiating it
 klook = {}        # dict class attribute -> normalized key -> tests that looked it up
+attr_known = set()
 kempty = set()     # dict class attributes whose emptiness is asked outside a test
 kunsafe = set()    # dict class attributes walked as a whole, or looked up outside a test
 attr_sites = {}    # expression attribute key -> "file:line" of import-time statements reading it
@@ -128,6 +129,7 @@ for f in sorted(glob.glob(f"{outdir}/cov-*.json")):
     for k_, v_ in d.get("attr_sites", {}).items():
         attr_sites.setdefault(k_, set()).update(v_)
     kunsafe.update(d.get("key_star", ()))
+    attr_known.update(d.get("attr_known", ()))
     for b, items in d.get("key_lookups", {}).items():
         tg = None
         if b in num:
@@ -297,6 +299,7 @@ out = {
     "klook": {ak: {nk: sid(v) for nk, v in d_.items()} for ak, d_ in klook.items() if ak not in kunsafe},
     "kunsafe": sorted(kunsafe),
     "kempty": sorted(kempty),
+    "attr_known": sorted(attr_known),
     "attr_global": sorted(attr_global),
     "ids": ids,
     "seconds": [t["seconds"] for t in tests],
