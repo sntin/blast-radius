@@ -284,6 +284,11 @@ class _KDict(dict):
         for b in self._bk:
             s.add(b + "|" + n)
 
+    def _rq(self):
+        s = key_lookups.setdefault(test_id or cur, set())
+        for b in self._bk:
+            s.add(b + "|?")
+
     def _star(self):
         if _kquiet[0]:
             return
@@ -339,6 +344,11 @@ class _KDict(dict):
         self._star()
         return dict.__len__(self)
 
+    def __bool__(self):
+        # a truth test only asks whether it is empty
+        self._rq()
+        return dict.__len__(self) > 0
+
     def __eq__(self, o):
         self._star()
         return dict.__eq__(self, o)
@@ -393,7 +403,12 @@ def _kset_cls(base):
         __slots__ = ("_bk",)
 
         _rk = _KDict._rk
+        _rq = _KDict._rq
         _star = _KDict._star
+
+        def __bool__(self):
+            self._rq()
+            return base.__len__(self) > 0
 
         def __contains__(self, k):
             self._rk(k)

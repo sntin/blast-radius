@@ -11,6 +11,7 @@ For every patch in /data/commits:
 Logs go to stderr; stdout carries one JSON line per commit.
 """
 import ast
+import copy
 import gzip
 import io
 import json
@@ -126,6 +127,7 @@ class Maps:
         self.attr_global = set(m.get("attr_global", []))
         self.klook = m.get("klook", {})
         self.kunsafe = set(m.get("kunsafe", []))
+        self.kempty = set(m.get("kempty", []))
         self.attr_import = m.get("attr_import", {})
         self.attr_sites = m.get("attr_sites", {})
         self.dial_sites = m.get("dial_sites", {})
@@ -948,6 +950,18 @@ class Planner:
         diffs = list(ast_diff(old_tree, new_tree))
         if not diffs:
             return set(), ["comment-only"]
+        if len(diffs) <= 4 and self._same_without_pass(old_tree, new_tree):
+            return set(), ["pass-only"]
+        # only docstring text changed: nothing in sqlglot or the listed tests reads __doc__
+        # (doctests are not among the tests), so no test can see it
+        docs = set()
+        for n in ast.walk(old_tree):
+            if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.body:
+                b0 = n.body[0]
+                if isinstance(b0, ast.Expr) and isinstance(b0.value, ast.Constant) and isinstance(b0.value.value, str):
+                    docs.add(id(b0.value))
+        if docs and all(id(nd) in docs and fl == "value" for nd, fl, _ in diffs):
+            return set(), ["docstring-only"]
         future_ann = any(
             isinstance(n, ast.ImportFrom) and n.module == "__future__" and any(a.name == "annotations" for a in n.names)
             for n in old_tree.body
@@ -968,6 +982,28 @@ class Planner:
                 self.full |= c
             cand |= c
         return cand, why
+
+    @staticmethod
+    def _same_without_pass(a, b):
+        """The trees are equal once `pass` statements in bodies that hold something else are
+        dropped (an added or removed `pass` there does nothing)."""
+        def count(t):
+            return sum(isinstance(x, ast.Pass) for x in ast.walk(t))
+
+        if count(a) == count(b):
+            return False
+
+        def strip(t):
+            t = copy.deepcopy(t)
+            for x in ast.walk(t):
+                for f in ("body", "orelse", "finalbody"):
+                    v = getattr(x, f, None)
+                    if isinstance(v, list) and v and all(isinstance(y, ast.stmt) for y in v):
+                        kept = [y for y in v if not isinstance(y, ast.Pass)]
+                        setattr(x, f, kept if kept else v[:1])
+            return ast.dump(t)
+
+        return strip(a) == strip(b)
 
     def scope_of(self, idx, node):
         """Innermost function/lambda whose *body* contains node, else None. Also says if node
@@ -1192,6 +1228,7 @@ class Planner:
             if a is None or b is None or a[1] != b[1]:
                 return None
             changed = set()
+            values_only = set(a[0]) == set(b[0])
             for k in set(a[0]) | set(b[0]):
                 if a[0].get(k) != b[0].get(k):
                     changed |= (a[0].get(k) or b[0].get(k))[0]
@@ -1203,17 +1240,24 @@ class Planner:
             if a is None or b is None or a[0] != b[0]:
                 return None
             changed = set()
+            values_only = False
             for k in set(a[1]) ^ set(b[1]):
                 changed |= (a[1].get(k) or b[1].get(k))
         if not changed:
             return None
+        if isinstance(st.value, ast.Dict):
+            if not a[0] or not b[0]:
+                changed.add("?")  # it may have become empty or stopped being empty
+        elif not (a[0] == "SET" and a[1] and b[1]):
+            changed.add("?")
         akeys = list(self.owner_keys(classes, {nm}))
         if names & self.s.import_names:
             res = self.import_derivations(names, rel, classes)
             if res is None:
                 return None  # read at import in a way we cannot follow
             if res[0] and not (nm == "KEYWORDS" and set(res[0]) <= TOKENIZER_KEY_DERIVED
-                               and all(KEYWORD_WORD.match(f) for f in changed)):
+                               and all(KEYWORD_WORD.match(f) for f in changed)) \
+                    and not (values_only and self.derived_from_keys_only(nm, rel)):
                 return None  # derived by a metaclass
             extra = res[1]
             if extra:
@@ -1226,7 +1270,7 @@ class Planner:
             akeys.append(own)
         out = set()
         for ak in akeys:
-            if ak in self.m.kunsafe or ak in self.m.attr_global:
+            if ak in self.m.kunsafe or ak in self.m.attr_global or ("?" in changed and ak in self.m.kempty):
                 return None
             d = self.m.klook.get(ak)
             if not d:
@@ -1235,6 +1279,82 @@ class Planner:
                 if f in d:
                     out |= self.m.sets[d[f]]
         return out
+
+    def derived_from_keys_only(self, nm, rel):
+        """Every import-time read of attribute `nm` in a metaclass method only asks which keys it
+        has (`k in X`, iterating its keys), and no other statement of the changed file builds
+        another attribute from it: then a change to its values leaves all derived attributes as
+        they were."""
+        sites = self.s.import_sites.get(nm, ())
+        if not sites:
+            return False
+        key_calls = {"set", "frozenset", "list", "tuple", "sorted", "len"}
+        for site in sites:
+            tree = self.s.tree(site[1])
+            if tree is None:
+                return False
+            if site[0] != "meta":
+                if site[1] != rel:
+                    continue  # copies elsewhere are followed by import_derivations
+                found = self._class_stmt(site[1], site[2])
+                if found is None:
+                    return False
+                st = found[0]
+                tg = st.targets if isinstance(st, ast.Assign) else [getattr(st, "target", None)]
+                if not (len(tg) == 1 and isinstance(tg[0], ast.Name) and tg[0].id == nm):
+                    if any(isinstance(t, ast.Attribute) and t.attr == nm or isinstance(t, ast.Name) and t.id == nm
+                           or isinstance(t, ast.Constant) and t.value == nm for t in ast.walk(st)):
+                        return False
+                continue
+            fn = None
+            for x in ast.walk(tree):
+                if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)) and x.lineno == site[2]:
+                    fn = x
+                    break
+            if fn is None:
+                return False
+            parent = {}
+            for x in ast.walk(fn):
+                for c in ast.iter_child_nodes(x):
+                    parent[c] = x
+            aliases = set()
+
+            def keys_use(node):
+                p = parent.get(node)
+                if isinstance(p, ast.Compare) and node in p.comparators and all(isinstance(o, (ast.In, ast.NotIn)) for o in p.ops):
+                    return True
+                if isinstance(p, ast.Attribute) and p.attr == "keys" and isinstance(parent.get(p), ast.Call):
+                    return True
+                if isinstance(p, (ast.For, ast.comprehension)) and p.iter is node:
+                    return True
+                if isinstance(p, ast.Starred) and isinstance(parent.get(p), (ast.List, ast.Tuple, ast.Set)):
+                    return True
+                if isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.func.id in key_calls and p.args == [node]:
+                    return True
+                return False
+
+            for x in ast.walk(fn):
+                hit = (isinstance(x, ast.Attribute) and x.attr == nm) or (isinstance(x, ast.Constant) and x.value == nm)
+                if not hit:
+                    continue
+                if isinstance(x, ast.Constant) or not isinstance(x.ctx, ast.Load):
+                    return False
+                if keys_use(x):
+                    continue
+                p = parent.get(x)
+                if isinstance(p, ast.Assign) and len(p.targets) == 1 and isinstance(p.targets[0], ast.Name) and p.value is x:
+                    aliases.add(p.targets[0].id)
+                    continue
+                return False
+            for x in ast.walk(fn):
+                if isinstance(x, ast.Name) and x.id in aliases:
+                    if isinstance(x.ctx, ast.Store):
+                        if not (isinstance(parent.get(x), ast.Assign) and isinstance(parent[x].value, ast.Attribute)
+                                and parent[x].value.attr == nm):
+                            return False
+                    elif not keys_use(x):
+                        return False
+        return True
 
     def owner_keys(self, classes, attrs):
         """attrusers keys for attributes `attrs` of the changed class chain (innermost first),
@@ -1778,6 +1898,16 @@ class Planner:
         if scope is not None and where == "sig":
             fn = scope
             extra |= self.lines_tests(rel, fn.lineno, fn.end_lineno)
+            if (
+                isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and isinstance(node, ast.Constant)
+                and field == "value"
+                and any(d is node for d in fn.args.defaults + fn.args.kw_defaults if d is not None)
+            ):
+                # a constant default value: only calls that leave that argument out see it, and
+                # they run the function body (nothing in sqlglot reads __defaults__)
+                body = self.lines_tests(rel, fn.body[0].lineno, fn.end_lineno)
+                return body, why + ["default-arg"]
             if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 nu = self.name_users([fn.name])
                 if nu == ALL:
@@ -2282,7 +2412,7 @@ def main():
                     cand = rest
         blind, run = choose(cand, maps, pcfg, min_run=GAMBLE_EVIDENCE if job["gamble"] else 0)
         job["partial"] = {n: pcfg[n] for n in run if n in pcfg}
-        rt_only = all(w.split(":", 2)[1].startswith(("rt", "lambda", "comment-only", "uncovered", "fixture", "other", "annotation"))
+        rt_only = all(w.split(":", 2)[1].startswith(("rt", "lambda", "comment-only", "docstring-only", "uncovered", "fixture", "other", "annotation"))
                       for w in why if w.count(":") >= 1) if why and why != ["error"] else False
         extra_imp = getattr(planner, "extra_imp", set()) if why != ["error"] else set()
         if cand != set(range(maps.n)) and (not rt_only or extra_imp):

@@ -80,6 +80,7 @@ import_exec = {}   # (file, line) -> sqlglot modules whose import ran it
 attr_import = {}   # class attribute key -> sqlglot modules whose import read it
 dial_sites = {}    # dialect-machinery module -> "file:line" of import-time statements instantiating it
 klook = {}        # dict class attribute -> normalized key -> tests that looked it up
+kempty = set()     # dict class attributes whose emptiness is asked outside a test
 kunsafe = set()    # dict class attributes walked as a whole, or looked up outside a test
 attr_sites = {}    # expression attribute key -> "file:line" of import-time statements reading it
 imp_users = {}   # sqlglot module -> test files that import it at module level
@@ -138,7 +139,9 @@ for f in sorted(glob.glob(f"{outdir}/cov-*.json")):
             tg = {num[x] for x in num if x.startswith(b[6:] + "::")} or None
         for it in items:
             ak, nk = it.split("|", 1)
-            if tg is None or nk == "*":
+            if tg is None and nk == "?":
+                kempty.add(ak)  # emptiness asked outside a test: any test may depend on it
+            elif tg is None or nk == "*":
                 kunsafe.add(ak)
             else:
                 klook.setdefault(ak, {}).setdefault("*" if nk == "*t" else nk, set()).update(tg)
@@ -293,6 +296,7 @@ out = {
     "attrusers": {k_: sid(v) for k_, v in attrusers.items()},
     "klook": {ak: {nk: sid(v) for nk, v in d_.items()} for ak, d_ in klook.items() if ak not in kunsafe},
     "kunsafe": sorted(kunsafe),
+    "kempty": sorted(kempty),
     "attr_global": sorted(attr_global),
     "ids": ids,
     "seconds": [t["seconds"] for t in tests],
