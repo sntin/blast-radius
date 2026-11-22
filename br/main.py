@@ -1973,6 +1973,8 @@ class Planner:
                 rt = rt | ie
             if not rt:
                 why.append(f"uncovered:{a_}")
+            if not iem:
+                self.rt_spans.append((rel, scope.lineno, scope.end_lineno))
             return rt, why + [f"rt:{a_}-{b_}"]
         # import-time change
         st = self.stmt_of(idx, node)
@@ -2195,6 +2197,7 @@ class Planner:
         why = []
         self.m.touched_setup = set()
         self.full, self.ks = set(), {}
+        self.rt_spans = []
         self.extra_imp, self.extra_check = set(), set()
         for old_rel, new_rel, old, new, changed, inserted in files:
             rel = old_rel or new_rel
@@ -2276,6 +2279,8 @@ TOKENIZER_KEY_DERIVED = {"_KEYWORD_TRIE", "_COMMENTS", "SUPPORTS_COLUMN_JOIN_MAR
 KEYWORD_WORD = re.compile(r"^s:[A-Za-z0-9_]+$")
 GAMBLE_SECONDS = 5.0     # recorded seconds and runner cpu above which a test is not run
 GAMBLE_P_FAIL = 0.3      # rough chance that a cheaper test fails, which then costs the blind selection
+GAMBLE_ALL_RUN = os.environ.get("BR_GAMBLE_ALL_RUN", "0") == "1"
+GAMBLE_SAME_PATH = int(os.environ.get("BR_GAMBLE_SAME_PATH", "2"))
 GAMBLE_EVIDENCE = 5      # cheaper candidates that must run (and pass) to leave such a test out
 EXPR_ARG_ATTRS = {"arg_types", "is_var_len_args"}
 RUN_OVERHEAD = 0.12      # fork + import sqlglot in a child, seconds of CPU
@@ -2502,6 +2507,38 @@ def main():
                     job["gamble"] = gamble
                     cand = rest
         blind, run = choose(cand, maps, pcfg, min_run=GAMBLE_EVIDENCE if job["gamble"] else 0)
+        if job["gamble"] and GAMBLE_ALL_RUN and blind:
+            # the expensive ones would be selected anyway: plan the whole set as usual
+            cand = cand | job["gamble"]
+            job["gamble"] = set()
+            blind, run = choose(cand, maps, pcfg)
+        spans = getattr(planner, "rt_spans", [])
+        if job["gamble"] and spans:
+            # evidence must include the cheapest tests that take the same path through the
+            # changed functions as each expensive one: a sample on other paths says little
+            hits = {}
+            for r_, a_, b_ in spans:
+                for L in range(a_, b_ + 1):
+                    for x in maps.tests_at(r_, L):
+                        hits.setdefault(x, []).append((r_, L))
+            need = set()
+            others = [x for x in cand if x not in maps.no_run]
+            for g in job["gamble"]:
+                sig = hits.get(g, [])
+                same = sorted((x for x in others if hits.get(x, []) == sig),
+                              key=lambda x: (maps.cpu.get(x, maps.seconds[x] * 1.5), x))
+                if not same:
+                    # nothing cheaper runs that path: do not leave it out
+                    need = None
+                    break
+                need |= set(same[:GAMBLE_SAME_PATH])
+            if need is None:
+                cand = cand | job["gamble"]
+                job["gamble"] = set()
+                blind, run = choose(cand, maps, pcfg)
+            else:
+                blind = [x for x in blind if x not in need]
+                run = list(run) + sorted(need - set(run))
         job["partial"] = {n: pcfg[n] for n in run if n in pcfg}
         rt_only = all(w.split(":", 2)[1].startswith(("rt", "lambda", "comment-only", "docstring-only", "uncovered", "fixture", "other", "annotation"))
                       for w in why if w.count(":") >= 1) if why and why != ["error"] else False
@@ -2588,7 +2625,10 @@ def main():
                 log(j["cid"], f"import check failed: {len(j['imp_only'])} importing tests selected")
         if j.get("gamble"):
             ran_ok = len(j["done"] - j["fail"])
-            if j["fail"] or (set(j["run"]) - j["done"]) or ran_ok < GAMBLE_EVIDENCE:
+            # only when every other candidate ran and passed: a passing sample of them says
+            # little about the rest, and the expensive ones fail with them
+            unrun = set(j["blind"]) - set(j["gamble"])
+            if j["fail"] or (set(j["run"]) - j["done"]) or ran_ok < GAMBLE_EVIDENCE or (GAMBLE_ALL_RUN and unrun):
                 sel |= j["gamble"]
             else:
                 log(j["cid"], f"left out {len(j['gamble'])} expensive candidates: {ran_ok} cheaper ones passed")
